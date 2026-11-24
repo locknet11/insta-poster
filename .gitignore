@@ -1,0 +1,57 @@
+# Environment & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+*.p12
+*secret*.json
+*credentials*.json
+*session*.json
+instagrapi_session.json
+cookies.json
+
+# Runtime data & SQLite databases (pool media, settings, users, sessions)
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Frontend / Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+backend/insta_poster/static/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Local reference repos
+InstaPy/
+
+# OS & Editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
