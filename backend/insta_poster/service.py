@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import random
 import re
@@ -17,9 +18,12 @@ from insta_poster.adapters import (
     InstagramAdapter,
 )
 from insta_poster.auth import (
+    generate_api_key,
     generate_session_token,
+    hash_api_key,
     hash_password,
     hash_session_token,
+    normalize_api_key_name,
     normalize_username,
     verify_dummy_password,
     verify_password,
@@ -42,6 +46,8 @@ from insta_poster.models import (
     ActivityLogEntry,
     AdapterConfigUpdate,
     AdapterStatus,
+    ApiKeyCreatedResponse,
+    ApiKeyPublic,
     DashboardStats,
     FolderSyncResponse,
     PoolImage,
@@ -405,6 +411,81 @@ class InstaPosterService:
             entity_type="user",
             entity_id=user_id,
             details={"username": user.username},
+        )
+
+    # ------------------------------------------------------------------
+    # API Keys (for AI agents & automation)
+    # ------------------------------------------------------------------
+    def _row_to_api_key(self, row: Any) -> ApiKeyPublic:
+        return ApiKeyPublic(
+            id=row["id"],
+            name=row["name"],
+            key_prefix=row["key_prefix"],
+            created_by=row["created_by"],
+            created_at=row["created_at"],
+            last_used_at=row["last_used_at"],
+        )
+
+    def list_api_keys(self) -> list[ApiKeyPublic]:
+        with self.db.connection() as conn:
+            rows = conn.execute("SELECT * FROM api_keys ORDER BY created_at DESC").fetchall()
+        return [self._row_to_api_key(r) for r in rows]
+
+    def create_api_key(self, name: str, *, created_by: str = "user") -> ApiKeyCreatedResponse:
+        clean_name = normalize_api_key_name(name)
+        raw_key, key_prefix, key_hash = generate_api_key()
+        key_id = uuid.uuid4().hex[:12]
+        now = utcnow_iso()
+
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO api_keys (id, name, key_prefix, key_hash, created_by, created_at, last_used_at)
+                VALUES (?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (key_id, clean_name, key_prefix, key_hash, created_by, now),
+            )
+            row = conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+
+        self.db.log_activity(
+            "api_keys.create",
+            actor=created_by,
+            entity_type="api_key",
+            entity_id=key_id,
+            details={"name": clean_name, "key_prefix": key_prefix},
+        )
+        pub = self._row_to_api_key(row)
+        return ApiKeyCreatedResponse(**pub.model_dump(), api_key=raw_key)
+
+    def verify_api_key(self, raw_key: str) -> ApiKeyPublic | None:
+        cleaned = (raw_key or "").strip()
+        if not cleaned:
+            return None
+        key_hash = hash_api_key(cleaned)
+        now = utcnow_iso()
+
+        with self.db.connection() as conn:
+            row = conn.execute("SELECT * FROM api_keys WHERE key_hash = ?", (key_hash,)).fetchone()
+            if not row or not hmac.compare_digest(row["key_hash"], key_hash):
+                return None
+            if row["last_used_at"] != now:
+                conn.execute("UPDATE api_keys SET last_used_at = ? WHERE id = ?", (now, row["id"]))
+                row = conn.execute("SELECT * FROM api_keys WHERE id = ?", (row["id"],)).fetchone()
+        return self._row_to_api_key(row)
+
+    def revoke_api_key(self, key_id: str, *, actor: str = "user") -> None:
+        with self.db.connection() as conn:
+            row = conn.execute("SELECT * FROM api_keys WHERE id = ?", (key_id,)).fetchone()
+            if not row:
+                raise KeyError(f"API Key no encontrada: {key_id}")
+            conn.execute("DELETE FROM api_keys WHERE id = ?", (key_id,))
+
+        self.db.log_activity(
+            "api_keys.revoke",
+            actor=actor,
+            entity_type="api_key",
+            entity_id=key_id,
+            details={"name": row["name"], "key_prefix": row["key_prefix"]},
         )
 
     # ------------------------------------------------------------------

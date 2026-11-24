@@ -141,7 +141,7 @@ uv run insta-poster adapter list --json
 
 Authenticate automated HTTP clients in one of two ways:
 
-1. **API Key:** configure `INSTA_POSTER_API_KEY` and send `X-API-Key: <key>`.
+1. **API Key (recommended):** create named API keys (`ipk_...`) directly in the Web UI under **Users → API Keys** (or via `insta-poster apikey create <name>`, or static `INSTA_POSTER_API_KEY` env var) and send `X-API-Key: <key>` or `Authorization: Bearer <key>`.
 2. **User Session Token:** call `POST /api/auth/login` with `{"username": "...", "password": "..."}` and send `Authorization: Bearer <token>`.
 
 ### Python SDK (Code Mode)

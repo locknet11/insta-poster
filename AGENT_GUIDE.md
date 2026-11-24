@@ -52,10 +52,10 @@ Endpoints principales:
 - `GET /api/publications?status=scheduled`
 
 > **Autenticación REST API:** todos los endpoints `/api/*` (salvo `/api/health`) requieren autenticación. Podés autenticarte de dos formas:
-> 1. **API Key (recomendado para agentes):** configurá `INSTA_POSTER_API_KEY` en el servidor y enviá el header `X-API-Key: <tu-clave>`.
+> 1. **API Key (recomendado para agentes):** creá una clave (`ipk_...`) desde la Web UI (**Usuarios → API Keys**), por CLI (`insta-poster apikey create mi-agente`) o vía `INSTA_POSTER_API_KEY`, y enviala en `X-API-Key: <tu-clave>` o `Authorization: Bearer <tu-clave>`.
 > 2. **Token de usuario:** hacé `POST /api/auth/login` con `{"username": "...", "password": "..."}` y enviá `Authorization: Bearer <token>`.
 >
-> También podés enviar `X-Actor: mi-agente` para que quede registrado en el log de actividad.
+> También podés enviar `X-Actor: mi-agente` para sobrescribir el nombre registrado en el log de actividad (por defecto se usa el nombre de la API Key).
 
 ---
 

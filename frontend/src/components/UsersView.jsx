@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from 'react';
-import { UserPlus, Trash2, KeyRound, RefreshCw } from 'lucide-react';
+import { UserPlus, Trash2, KeyRound, RefreshCw, Plus, Copy, Check, X } from 'lucide-react';
 import { api } from '../api.js';
 import { useI18n } from '../i18n.jsx';
 import SchematicCard from './SchematicCard.jsx';
@@ -7,7 +7,14 @@ import SchematicCard from './SchematicCard.jsx';
 export default function UsersView({ currentUser, notify }) {
   const { t, locale } = useI18n();
   const [users, setUsers] = useState([]);
+  const [apiKeys, setApiKeys] = useState([]);
   const [loading, setLoading] = useState(true);
+
+  // Create API key form
+  const [newKeyName, setNewKeyName] = useState('');
+  const [creatingKey, setCreatingKey] = useState(false);
+  const [revealedKey, setRevealedKey] = useState(null);
+  const [copiedId, setCopiedId] = useState('');
 
   // Create user form
   const [newUsername, setNewUsername] = useState('');
@@ -25,10 +32,11 @@ export default function UsersView({ currentUser, notify }) {
   const [resetPassword, setResetPassword] = useState('');
   const [resetting, setResetting] = useState(false);
 
-  const loadUsers = useCallback(async () => {
+  const loadAll = useCallback(async () => {
     try {
-      const list = await api.listUsers();
-      setUsers(list);
+      const [userList, keyList] = await Promise.all([api.listUsers(), api.listApiKeys()]);
+      setUsers(userList);
+      setApiKeys(keyList);
     } catch (err) {
       notify(t('users.toastLoadError', { error: err.message }), 'error');
     } finally {
@@ -37,8 +45,43 @@ export default function UsersView({ currentUser, notify }) {
   }, [notify, t]);
 
   useEffect(() => {
-    loadUsers();
-  }, [loadUsers]);
+    loadAll();
+  }, [loadAll]);
+
+  const copyValue = (id, text) => {
+    navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    setTimeout(() => setCopiedId(''), 1800);
+  };
+
+  const handleCreateApiKey = async (e) => {
+    e.preventDefault();
+    if (!newKeyName.trim()) return;
+    setCreatingKey(true);
+    try {
+      const created = await api.createApiKey(newKeyName.trim());
+      setNewKeyName('');
+      setRevealedKey(created);
+      notify(t('apikeys.toastCreated', { name: created.name }));
+      await loadAll();
+    } catch (err) {
+      notify(err.message, 'error');
+    } finally {
+      setCreatingKey(false);
+    }
+  };
+
+  const handleRevokeApiKey = async (k) => {
+    if (!window.confirm(t('apikeys.confirmRevoke', { name: k.name }))) return;
+    try {
+      await api.revokeApiKey(k.id);
+      if (revealedKey && revealedKey.id === k.id) setRevealedKey(null);
+      notify(t('apikeys.toastRevoked', { name: k.name }));
+      await loadAll();
+    } catch (err) {
+      notify(err.message, 'error');
+    }
+  };
 
   const handleCreateUser = async (e) => {
     e.preventDefault();
@@ -49,7 +92,7 @@ export default function UsersView({ currentUser, notify }) {
       setNewUsername('');
       setNewPassword('');
       notify(t('users.toastCreated', { username: created.username }));
-      await loadUsers();
+      await loadAll();
     } catch (err) {
       notify(err.message, 'error');
     } finally {
@@ -108,7 +151,7 @@ export default function UsersView({ currentUser, notify }) {
     try {
       await api.deleteUser(user.id);
       notify(t('users.toastDeleted', { username: user.username }));
-      await loadUsers();
+      await loadAll();
     } catch (err) {
       notify(err.message, 'error');
     }
@@ -124,10 +167,121 @@ export default function UsersView({ currentUser, notify }) {
           <h2>{t('users.title')}</h2>
           <p>{t('users.subtitle')}</p>
         </div>
-        <button type="button" className="btn" onClick={loadUsers}>
+        <button type="button" className="btn" onClick={loadAll}>
           <RefreshCw size={14} strokeWidth={1.5} /> {t('common.refresh')}
         </button>
       </div>
+
+      {/* API Keys Management for AI Agents */}
+      <SchematicCard
+        label={t('apikeys.sectionLabel', { count: apiKeys.length })}
+        right={<span className="badge">X-API-KEY // BEARER</span>}
+        noPadding
+      >
+        <div style={{ padding: 18, borderBottom: '1px dashed var(--dashed)' }} className="stack-sm">
+          <p style={{ margin: 0, fontSize: 12, color: 'var(--muted)' }}>{t('apikeys.sectionSub')}</p>
+
+          <form onSubmit={handleCreateApiKey} className="row" style={{ alignItems: 'flex-end' }}>
+            <div className="field" style={{ flex: 1, minWidth: 220 }}>
+              <label>
+                {t('apikeys.nameLabel')}
+                <span className="req">*</span>
+              </label>
+              <input
+                className="input"
+                type="text"
+                autoComplete="off"
+                placeholder={t('apikeys.namePlaceholder')}
+                value={newKeyName}
+                onChange={(e) => setNewKeyName(e.target.value)}
+              />
+            </div>
+            <button
+              type="submit"
+              className="btn btn-primary"
+              disabled={creatingKey || !newKeyName.trim()}
+            >
+              <Plus size={14} strokeWidth={1.5} />{' '}
+              {creatingKey ? t('apikeys.creating') : t('apikeys.createBtn')}
+            </button>
+          </form>
+
+          {revealedKey && (
+            <div className="secret-reveal">
+              <div className="row" style={{ justifyContent: 'space-between' }}>
+                <span className="subsection-title" style={{ color: 'var(--good-text)' }}>
+                  {t('apikeys.revealTitle', { name: revealedKey.name })}
+                </span>
+                <button
+                  type="button"
+                  className="btn btn-sm"
+                  onClick={() => setRevealedKey(null)}
+                  title={t('apikeys.dismiss')}
+                >
+                  <X size={12} strokeWidth={1.5} /> {t('apikeys.dismiss')}
+                </button>
+              </div>
+              <div style={{ fontSize: 11.5, color: 'var(--good-text)' }}>{t('apikeys.revealWarn')}</div>
+              <div className="row" style={{ alignItems: 'stretch' }}>
+                <code className="secret-reveal-key">{revealedKey.api_key}</code>
+                <button
+                  type="button"
+                  className="btn btn-ink"
+                  onClick={() => copyValue('raw', revealedKey.api_key)}
+                >
+                  {copiedId === 'raw' ? <Check size={13} strokeWidth={1.5} /> : <Copy size={13} strokeWidth={1.5} />}{' '}
+                  {copiedId === 'raw' ? t('common.copied') : t('common.copy')}
+                </button>
+                <button
+                  type="button"
+                  className="btn"
+                  onClick={() => copyValue('hdr', `X-API-Key: ${revealedKey.api_key}`)}
+                >
+                  {copiedId === 'hdr' ? <Check size={13} strokeWidth={1.5} /> : <Copy size={13} strokeWidth={1.5} />}{' '}
+                  {copiedId === 'hdr' ? t('common.copied') : t('apikeys.copyHeader')}
+                </button>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {apiKeys.length === 0 ? (
+          <div className="empty-state">
+            <p className="empty-state-title">{t('apikeys.emptyTitle')}</p>
+            <p className="empty-state-sub">{t('apikeys.emptySub')}</p>
+          </div>
+        ) : (
+          <div className="schematic-list">
+            {apiKeys.map((k) => (
+              <div key={k.id} className="user-row">
+                <div>
+                  <div className="row" style={{ gap: 8 }}>
+                    <strong style={{ fontSize: 12.5 }}>{k.name}</strong>
+                    <span className="badge">{k.key_prefix}••••••••</span>
+                    <span style={{ fontSize: 11, color: 'var(--muted)' }}>#{k.id}</span>
+                  </div>
+                  <div style={{ fontSize: 10.5, color: 'var(--muted)', marginTop: 4 }}>
+                    {t('apikeys.metaRow', {
+                      created: new Date(k.created_at).toLocaleDateString(locale),
+                      by: k.created_by,
+                      lastUsed: k.last_used_at
+                        ? new Date(k.last_used_at).toLocaleString(locale)
+                        : t('common.never').toUpperCase(),
+                    })}
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  className="btn btn-sm btn-danger"
+                  onClick={() => handleRevokeApiKey(k)}
+                >
+                  <Trash2 size={12} strokeWidth={1.5} /> {t('apikeys.revoke')}
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+      </SchematicCard>
 
       <div className="two-col">
         <div className="stack">

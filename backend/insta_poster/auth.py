@@ -114,6 +114,30 @@ def hash_session_token(token: str) -> str:
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+API_KEY_PREFIX = "ipk_"
+
+
+def normalize_api_key_name(name: str) -> str:
+    cleaned = " ".join(name.strip().split())
+    if not cleaned:
+        raise ValueError("El nombre de la API Key es obligatorio.")
+    if len(cleaned) > 64:
+        raise ValueError("El nombre de la API Key no puede superar los 64 caracteres.")
+    return cleaned
+
+
+def generate_api_key() -> tuple[str, str, str]:
+    """Return (raw_key, display_prefix, sha256_hash)."""
+    raw = f"{API_KEY_PREFIX}{secrets.token_urlsafe(32)}"
+    prefix = raw[:12]
+    key_hash = hash_api_key(raw)
+    return raw, prefix, key_hash
+
+
+def hash_api_key(raw_key: str) -> str:
+    return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()
+
+
 def sign_media_filename(filename: str, secret: str, *, ttl_seconds: int = 1800) -> tuple[int, str]:
     exp = int(time.time()) + max(60, ttl_seconds)
     msg = f"{filename}:{exp}".encode("utf-8")

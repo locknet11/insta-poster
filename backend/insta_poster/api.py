@@ -12,7 +12,7 @@ from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from insta_poster.auth import LoginRateLimiter, verify_media_signature
+from insta_poster.auth import API_KEY_PREFIX, LoginRateLimiter, verify_media_signature
 from insta_poster.config import (
     AppPaths,
     get_api_key,
@@ -26,6 +26,9 @@ from insta_poster.models import (
     ActivityLogEntry,
     AdapterConfigUpdate,
     AdapterStatus,
+    ApiKeyCreatedResponse,
+    ApiKeyCreateRequest,
+    ApiKeyPublic,
     AuthLoginResponse,
     AuthStatusResponse,
     ChangePasswordRequest,
@@ -54,6 +57,7 @@ class AuthContext:
     username: str
     auth_method: Literal["cookie", "bearer", "api_key", "disabled"]
     user: UserPublic | None = None
+    api_key: ApiKeyPublic | None = None
     session_token: str | None = None
 
 
@@ -167,12 +171,28 @@ def create_app(
 
         expected_key = get_api_key()
         provided_key = request.headers.get("x-api-key")
-        if expected_key and provided_key and hmac.compare_digest(provided_key, expected_key):
-            header_actor = (request.headers.get("x-actor") or "api-key").strip() or "api-key"
-            return AuthContext(username=header_actor, auth_method="api_key")
+        if provided_key:
+            if expected_key and hmac.compare_digest(provided_key, expected_key):
+                header_actor = (request.headers.get("x-actor") or "api-key").strip() or "api-key"
+                return AuthContext(username=header_actor, auth_method="api_key")
+            db_key = service.verify_api_key(provided_key)
+            if db_key:
+                return AuthContext(
+                    username=db_key.name,
+                    auth_method="api_key",
+                    api_key=db_key,
+                )
 
         bearer = _extract_bearer_token(request)
         if bearer:
+            if bearer.startswith(API_KEY_PREFIX):
+                db_key = service.verify_api_key(bearer)
+                if db_key:
+                    return AuthContext(
+                        username=db_key.name,
+                        auth_method="api_key",
+                        api_key=db_key,
+                    )
             user = service.verify_session_token(bearer)
             if user:
                 return AuthContext(
@@ -210,6 +230,8 @@ def create_app(
             return raw
         if auth.user is not None:
             return auth.user.username
+        if auth.api_key is not None:
+            return auth.api_key.name
         return raw or "api"
 
     # ------------------------------------------------------------------
@@ -418,6 +440,34 @@ def create_app(
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
+    # API Keys (for AI agents & automation)
+    # ------------------------------------------------------------------
+    @app.get("/api/api-keys", response_model=list[ApiKeyPublic], dependencies=[Depends(_require_auth)])
+    def list_api_keys() -> list[ApiKeyPublic]:
+        return service.list_api_keys()
+
+    @app.post("/api/api-keys", response_model=ApiKeyCreatedResponse)
+    def create_api_key(
+        payload: ApiKeyCreateRequest,
+        actor: str = Depends(_parse_actor),
+    ) -> ApiKeyCreatedResponse:
+        try:
+            return service.create_api_key(payload.name, created_by=actor)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/api-keys/{key_id}")
+    def revoke_api_key(
+        key_id: str,
+        actor: str = Depends(_parse_actor),
+    ) -> dict[str, Any]:
+        try:
+            service.revoke_api_key(key_id, actor=actor)
+            return {"deleted": True, "id": key_id}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    # ------------------------------------------------------------------
     # Health, stats & agent discovery
     # ------------------------------------------------------------------
     @app.get("/api/health")
@@ -442,7 +492,8 @@ def create_app(
             "name": "insta-poster",
             "modes": ["cli", "rest_api", "python_code_mode"],
             "auth": {
-                "api_key_header": "X-API-Key: <INSTA_POSTER_API_KEY>",
+                "api_key_header": "X-API-Key: ipk_... (create in Web UI -> Users -> API Keys, or INSTA_POSTER_API_KEY env)",
+                "bearer_header": "Authorization: Bearer <ipk_... or login session token>",
                 "bearer_login": "POST /api/auth/login -> Authorization: Bearer <token>",
             },
             "cli_examples": [

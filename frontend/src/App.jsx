@@ -212,6 +212,7 @@ export default function App() {
         {tab === 'settings' && (
           <SettingsAgentView
             adapters={adapters}
+            onNavigate={setTab}
             onRefresh={refreshAll}
             notify={notify}
           />

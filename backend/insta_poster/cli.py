@@ -26,6 +26,7 @@ story_app = typer.Typer(help="Crear y publicar historias (Stories 9:16).")
 queue_app = typer.Typer(help="Consultar, publicar o cancelar la cola e historial.")
 adapter_app = typer.Typer(help="Gestionar adaptadores de Instagram (dry_run, graph_api).")
 user_app = typer.Typer(help="Gestionar usuarios de autenticación de la webapp y API.")
+apikey_app = typer.Typer(help="Gestionar API Keys para agentes y automatizaciones.")
 
 app.add_typer(pool_app, name="pool")
 app.add_typer(post_app, name="post")
@@ -33,6 +34,7 @@ app.add_typer(story_app, name="story")
 app.add_typer(queue_app, name="queue")
 app.add_typer(adapter_app, name="adapter")
 app.add_typer(user_app, name="user")
+app.add_typer(apikey_app, name="apikey")
 
 console = Console()
 
@@ -616,6 +618,71 @@ def user_delete(
         _emit({"deleted": True, "id": user.id, "username": user.username}, True)
     else:
         console.print(f"[green]Usuario eliminado[/green]: {user.username}")
+
+
+# ----------------------------------------------------------------------
+# API Key management commands
+# ----------------------------------------------------------------------
+@apikey_app.command("list")
+def apikey_list(
+    as_json: bool = typer.Option(False, "--json"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+) -> None:
+    """Lista las API Keys registradas."""
+    svc = _get_service(data_dir)
+    keys = svc.list_api_keys()
+    if as_json:
+        _emit([k.model_dump() for k in keys], True)
+        return
+    table = Table(title=f"API Keys ({len(keys)})")
+    table.add_column("ID", style="cyan")
+    table.add_column("Nombre", style="bold")
+    table.add_column("Prefijo")
+    table.add_column("Creada por")
+    table.add_column("Último uso")
+    for k in keys:
+        table.add_row(k.id, k.name, f"{k.key_prefix}...", k.created_by, k.last_used_at or "-")
+    console.print(table)
+
+
+@apikey_app.command("create")
+def apikey_create(
+    name: str = typer.Argument(..., help="Nombre descriptivo (ej. claude-code, n8n)."),
+    as_json: bool = typer.Option(False, "--json"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+) -> None:
+    """Crea una nueva API Key (se muestra una sola vez)."""
+    svc = _get_service(data_dir)
+    try:
+        created = svc.create_api_key(name, created_by="cli")
+    except Exception as exc:
+        typer.echo(json.dumps({"error": str(exc)}) if as_json else f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+    if as_json:
+        _emit(created.model_dump(), True)
+    else:
+        console.print(f"[green]API Key creada[/green] ({created.name} · {created.id}):")
+        console.print(f"[bold]{created.api_key}[/bold]")
+        console.print("[yellow]Guardala ahora: no volverá a mostrarse.[/yellow]")
+
+
+@apikey_app.command("revoke")
+def apikey_revoke(
+    key_id: str = typer.Argument(..., help="ID de la API Key a revocar."),
+    as_json: bool = typer.Option(False, "--json"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+) -> None:
+    """Revoca y elimina una API Key existente."""
+    svc = _get_service(data_dir)
+    try:
+        svc.revoke_api_key(key_id, actor="cli")
+    except Exception as exc:
+        typer.echo(json.dumps({"error": str(exc)}) if as_json else f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+    if as_json:
+        _emit({"deleted": True, "id": key_id}, True)
+    else:
+        console.print(f"[green]API Key revocada[/green]: {key_id}")
 
 
 if __name__ == "__main__":

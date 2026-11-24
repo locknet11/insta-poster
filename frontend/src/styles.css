@@ -1118,6 +1118,28 @@ pre,
   border-bottom: none;
 }
 
+.secret-reveal {
+  padding: 14px 16px;
+  border: 1px dashed var(--good);
+  background: var(--good-soft);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.secret-reveal-key {
+  background: var(--surface);
+  border: 1px solid var(--ink);
+  border-radius: var(--radius);
+  padding: 9px 12px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--ink);
+  word-break: break-all;
+  flex: 1;
+}
+
 /* Auth Screen */
 .auth-screen {
   min-height: 100vh;

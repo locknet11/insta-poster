@@ -185,3 +185,20 @@ class AuthLoginResponse(BaseModel):
     user: UserPublic
     token: str
     expires_at: str
+
+
+class ApiKeyPublic(BaseModel):
+    id: str
+    name: str
+    key_prefix: str
+    created_by: str
+    created_at: str
+    last_used_at: str | None = None
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=64)
+
+
+class ApiKeyCreatedResponse(ApiKeyPublic):
+    api_key: str

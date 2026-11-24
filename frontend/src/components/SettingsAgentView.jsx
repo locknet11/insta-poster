@@ -1,10 +1,10 @@
 import React, { useEffect, useState } from 'react';
-import { Copy, Check, ExternalLink, PlugZap, Save } from 'lucide-react';
+import { Copy, Check, ExternalLink, PlugZap, Save, KeyRound } from 'lucide-react';
 import { api } from '../api.js';
 import { useI18n } from '../i18n.jsx';
 import SchematicCard from './SchematicCard.jsx';
 
-export default function SettingsAgentView({ adapters, onRefresh, notify }) {
+export default function SettingsAgentView({ adapters, onNavigate, onRefresh, notify }) {
   const { t } = useI18n();
   const [settings, setSettings] = useState(null);
   const [schema, setSchema] = useState(null);
@@ -209,7 +209,17 @@ export default function SettingsAgentView({ adapters, onRefresh, notify }) {
         </SchematicCard>
 
         <div className="stack">
-          <SchematicCard label={t('settings.agentLabel')} bodyClassName="stack">
+          <SchematicCard
+            label={t('settings.agentLabel')}
+            right={
+              onNavigate && (
+                <button type="button" className="btn btn-sm btn-primary" onClick={() => onNavigate('users')}>
+                  <KeyRound size={12} strokeWidth={1.5} /> {t('settings.manageApiKeys')}
+                </button>
+              )
+            }
+            bodyClassName="stack"
+          >
             <p style={{ margin: 0, fontSize: 12, color: 'var(--muted)' }}>{t('settings.agentDesc')}</p>
 
             <div className="stack-sm">

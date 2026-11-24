@@ -75,6 +75,13 @@ export const api = {
       body: JSON.stringify({ password }),
     }),
   deleteUser: (userId) => request(`/api/users/${userId}`, { method: 'DELETE' }),
+  listApiKeys: () => request('/api/api-keys'),
+  createApiKey: (name) =>
+    request('/api/api-keys', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    }),
+  revokeApiKey: (keyId) => request(`/api/api-keys/${keyId}`, { method: 'DELETE' }),
 
   // Core app endpoints
   health: () => request('/api/health', { skipUnauthorizedHandler: true }),

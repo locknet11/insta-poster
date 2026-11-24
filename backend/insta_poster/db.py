@@ -101,6 +101,18 @@ CREATE TABLE IF NOT EXISTS user_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_sessions_user ON user_sessions(user_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_expires ON user_sessions(expires_at);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    key_prefix TEXT NOT NULL,
+    key_hash TEXT NOT NULL UNIQUE,
+    created_by TEXT NOT NULL DEFAULT 'user',
+    created_at TEXT NOT NULL,
+    last_used_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_keys_created ON api_keys(created_at DESC);
 """
 
 

@@ -261,3 +261,76 @@ def test_cli_user_management(tmp_path: Path) -> None:
 
     r_del_force = runner.invoke(cli_app, ["user", "delete", "juan", "--force", "--json", "--data-dir", str(data_dir)])
     assert r_del_force.exit_code == 0, r_del_force.output
+
+
+def test_api_keys_crud_auth_actor_and_cli(tmp_path: Path) -> None:
+    data_dir = tmp_path / "apikeys_data"
+    app = create_app(data_dir=data_dir, enable_scheduler=False)
+    owner = TestClient(app)
+    agent = TestClient(app)
+
+    assert owner.post("/api/auth/setup", json={"username": "locknet", "password": "owner-password"}).status_code == 200
+
+    # Create API key via UI endpoint
+    created_resp = owner.post("/api/api-keys", json={"name": "claude-agent"})
+    assert created_resp.status_code == 200
+    created = created_resp.json()
+    raw_key = created["api_key"]
+    key_id = created["id"]
+    assert raw_key.startswith("ipk_")
+    assert created["key_prefix"] == raw_key[:12]
+    assert created["created_by"] == "locknet"
+    assert created["last_used_at"] is None
+
+    # Listing keys NEVER exposes the full secret
+    listed = owner.get("/api/api-keys").json()
+    assert len(listed) == 1
+    assert "api_key" not in listed[0]
+    assert listed[0]["name"] == "claude-agent"
+
+    # Agent authenticates via X-API-Key header
+    assert agent.get("/api/stats", headers={"X-API-Key": "ipk_invalid"}).status_code == 401
+    assert agent.get("/api/stats", headers={"X-API-Key": raw_key}).status_code == 200
+
+    # Agent also authenticates via Authorization: Bearer ipk_...
+    assert agent.get("/api/stats", headers={"Authorization": f"Bearer {raw_key}"}).status_code == 200
+
+    # Upload + publish attributes actor to API key name by default
+    up = agent.post(
+        "/api/pool/upload",
+        files=[("files", ("bot.png", _png_bytes(), "image/png"))],
+        headers={"X-API-Key": raw_key},
+    )
+    assert up.status_code == 200
+    img_id = up.json()["added"][0]["id"]
+    pub = agent.post(
+        "/api/publications",
+        json={"pub_type": "story", "image_ids": [img_id], "publish_now": True},
+        headers={"X-API-Key": raw_key},
+    )
+    assert pub.status_code == 200
+    assert pub.json()["created_by"] == "claude-agent"
+
+    # last_used_at is populated after use
+    listed_after = owner.get("/api/api-keys").json()
+    assert listed_after[0]["last_used_at"] is not None
+
+    # Revoking immediately blocks the agent
+    assert owner.delete(f"/api/api-keys/{key_id}").status_code == 200
+    assert agent.get("/api/stats", headers={"X-API-Key": raw_key}).status_code == 401
+    assert agent.get("/api/stats", headers={"Authorization": f"Bearer {raw_key}"}).status_code == 401
+
+    # CLI apikey create / list / revoke
+    runner = CliRunner()
+    r_c = runner.invoke(cli_app, ["apikey", "create", "cli-bot", "--json", "--data-dir", str(data_dir)])
+    assert r_c.exit_code == 0, r_c.output
+    cli_created = json.loads(r_c.output)
+    assert cli_created["api_key"].startswith("ipk_")
+
+    r_l = runner.invoke(cli_app, ["apikey", "list", "--json", "--data-dir", str(data_dir)])
+    assert r_l.exit_code == 0
+    assert [k["name"] for k in json.loads(r_l.output)] == ["cli-bot"]
+
+    r_r = runner.invoke(cli_app, ["apikey", "revoke", cli_created["id"], "--json", "--data-dir", str(data_dir)])
+    assert r_r.exit_code == 0
+    assert json.loads(runner.invoke(cli_app, ["apikey", "list", "--json", "--data-dir", str(data_dir)]).output) == []
