@@ -410,13 +410,29 @@ class InstaPosterService:
     # ------------------------------------------------------------------
     # Row mappers
     # ------------------------------------------------------------------
+    def _resolve_pool_filepath(self, stored_path: str, filename: str) -> str:
+        if stored_path and Path(stored_path).exists():
+            return stored_path
+        candidate = self.paths.pool_dir / filename
+        if candidate.exists():
+            return str(candidate)
+        return stored_path or str(candidate)
+
+    def _resolve_prepared_file(self, stored_path: str) -> str:
+        if stored_path and Path(stored_path).exists():
+            return stored_path
+        candidate = self.paths.prepared_dir / Path(stored_path).name
+        if candidate.exists():
+            return str(candidate)
+        return stored_path
+
     def _row_to_pool_image(self, row: Any) -> PoolImage:
         thumb_name = Path(row["thumbnail_path"]).name if row["thumbnail_path"] else row["filename"]
         return PoolImage(
             id=row["id"],
             filename=row["filename"],
             original_filename=row["original_filename"],
-            filepath=row["filepath"],
+            filepath=self._resolve_pool_filepath(row["filepath"], row["filename"]),
             thumbnail_url=f"/media/thumbnails/{thumb_name}",
             image_url=f"/media/pool/{row['filename']}",
             source_path=row["source_path"],
@@ -438,7 +454,8 @@ class InstaPosterService:
         )
 
     def _row_to_publication(self, row: Any) -> Publication:
-        prepared_files = json.loads(row["prepared_files"] or "[]")
+        raw_prepared = json.loads(row["prepared_files"] or "[]")
+        prepared_files = [self._resolve_prepared_file(p) for p in raw_prepared]
         hashtags = json.loads(row["hashtags"] or "[]")
         caption = row["caption"] or ""
         return Publication(
