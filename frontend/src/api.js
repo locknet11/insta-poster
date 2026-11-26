@@ -153,4 +153,29 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(payload),
     }),
+
+  // Insights & analytics
+  getInsights: (params = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+    });
+    const q = qs.toString();
+    return request(`/api/insights${q ? `?${q}` : ''}`);
+  },
+  syncInsights: (params = {}) => {
+    const qs = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '') qs.set(k, String(v));
+    });
+    const q = qs.toString();
+    return request(`/api/insights/sync${q ? `?${q}` : ''}`, { method: 'POST' });
+  },
+  getMediaInsight: (identifier) => request(`/api/insights/media/${encodeURIComponent(identifier)}`),
+  getMediaInsightHistory: (identifier, limit = 50) =>
+    request(`/api/insights/media/${encodeURIComponent(identifier)}/history?limit=${limit}`),
+  syncMediaInsight: (identifier) =>
+    request(`/api/insights/media/${encodeURIComponent(identifier)}/sync`, { method: 'POST' }),
+  syncPublicationInsights: (pubId) =>
+    request(`/api/publications/${encodeURIComponent(pubId)}/insights/sync`, { method: 'POST' }),
 };

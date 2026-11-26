@@ -49,6 +49,18 @@ class BackgroundScheduler:
                 logger.exception("Error while checking due scheduled publications")
 
             try:
+                sync_res = await asyncio.to_thread(self.service.run_periodic_insights_sync)
+                if sync_res is not None:
+                    logger.info(
+                        "Periodic insights sync finished: media=%d stories=%d errors=%d",
+                        sync_res.synced_media_count,
+                        sync_res.synced_stories_count,
+                        len(sync_res.errors),
+                    )
+            except Exception:
+                logger.exception("Error while running periodic insights sync")
+
+            try:
                 await asyncio.wait_for(self._stop_event.wait(), timeout=self.interval_seconds)
             except asyncio.TimeoutError:
                 continue

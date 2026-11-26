@@ -35,7 +35,11 @@ from insta_poster.models import (
     DashboardStats,
     FolderSyncRequest,
     FolderSyncResponse,
+    InsightsOverview,
+    InsightsSyncResponse,
     LoginRequest,
+    MediaInsight,
+    MediaInsightSnapshot,
     PoolImage,
     PoolImageUpdate,
     Publication,
@@ -507,6 +511,9 @@ def create_app(
                 "insta-poster story create --image <IMAGE_ID> --fit pad_blur --now --json",
                 "insta-poster queue list --status scheduled --json",
                 "insta-poster queue publish <PUB_ID> --json",
+                "insta-poster insights sync --days 7 --json",
+                "insta-poster insights overview --days 7 --sort views --json",
+                "insta-poster insights show <PUB_OR_MEDIA_ID> --history --json",
                 "insta-poster adapter list --json",
             ],
             "rest_endpoints": {
@@ -521,6 +528,11 @@ def create_app(
                 "create_publication": "POST /api/publications",
                 "publish_now": "POST /api/publications/{pub_id}/publish",
                 "list_publications": "GET /api/publications?status=scheduled&pub_type=story",
+                "insights_overview": "GET /api/insights?days=7&media_product_type=FEED|STORY|REELS&sort_by=views",
+                "insights_sync": "POST /api/insights/sync?days=7&stories_only=false",
+                "media_insight": "GET /api/insights/media/{identifier}",
+                "media_insight_history": "GET /api/insights/media/{identifier}/history",
+                "sync_publication_insights": "POST /api/publications/{pub_id}/insights/sync",
                 "adapters": "GET /api/adapters",
             },
             "python_code_mode": (
@@ -643,6 +655,11 @@ def create_app(
         try:
             prepare_for_instagram(Path(img.filepath), tmp, pub_type=pub_type, fit_mode=fit_mode)
             data = tmp.read_bytes()
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Archivo físico faltante en el pool para la imagen {image_id}: {exc.filename or img.filename}",
+            ) from exc
         finally:
             if tmp.exists():
                 tmp.unlink()
@@ -689,6 +706,11 @@ def create_app(
             return service.create_publication(payload)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Archivo de imagen no encontrado en disco: {exc.filename or exc}",
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -709,6 +731,11 @@ def create_app(
             return service.update_publication(pub_id, payload, actor=actor)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Archivo de imagen no encontrado en disco: {exc.filename or exc}",
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -722,8 +749,27 @@ def create_app(
             return service.publish_publication(pub_id, adapter_override=adapter, actor=actor)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Archivo de imagen no encontrado en disco: {exc.filename or exc}",
+            ) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/publications/{pub_id}/insights/sync", response_model=MediaInsight)
+    def sync_publication_insights(
+        pub_id: str,
+        actor: str = Depends(_parse_actor),
+    ) -> MediaInsight:
+        try:
+            return service.sync_publication_insights(pub_id, actor=actor)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
 
     @app.delete("/api/publications/{pub_id}")
     def delete_publication(pub_id: str, actor: str = Depends(_parse_actor)) -> dict[str, Any]:
@@ -736,6 +782,84 @@ def create_app(
     @app.post("/api/scheduler/run-due", response_model=list[Publication], dependencies=[Depends(_require_auth)])
     def trigger_scheduler() -> list[Publication]:
         return service.run_due_scheduled()
+
+    # ------------------------------------------------------------------
+    # Insights & analytics endpoints (Posts, Carousels, Reels, Stories)
+    # ------------------------------------------------------------------
+    @app.get("/api/insights", response_model=InsightsOverview, dependencies=[Depends(_require_auth)])
+    def get_insights(
+        days: int = Query(default=7, ge=1, le=30),
+        media_product_type: str | None = Query(default=None, pattern="^(FEED|STORY|REELS|feed|story|reels)$"),
+        sort_by: str = Query(
+            default="published_at",
+            pattern="^(published_at|views|reach|total_interactions|likes|saved|shares|profile_visits)$",
+        ),
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> InsightsOverview:
+        return service.get_insights_overview(
+            days=days,
+            media_product_type=media_product_type,
+            sort_by=sort_by,
+            limit=limit,
+        )
+
+    @app.post("/api/insights/sync", response_model=InsightsSyncResponse)
+    def sync_insights(
+        days: int = Query(default=7, ge=1, le=30),
+        include_account_media: bool = True,
+        stories_only: bool = False,
+        actor: str = Depends(_parse_actor),
+    ) -> InsightsSyncResponse:
+        try:
+            return service.sync_insights(
+                days=days,
+                include_account_media=include_account_media,
+                stories_only=stories_only,
+                actor=actor,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get("/api/insights/media/{identifier}", response_model=MediaInsight, dependencies=[Depends(_require_auth)])
+    def get_media_insight(identifier: str) -> MediaInsight:
+        try:
+            return service.get_media_insight(identifier)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/insights/media/{identifier}/sync", response_model=MediaInsight)
+    def sync_media_insight(
+        identifier: str,
+        actor: str = Depends(_parse_actor),
+    ) -> MediaInsight:
+        try:
+            return service.sync_publication_insights(identifier, actor=actor)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except RuntimeError as exc:
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    @app.get(
+        "/api/insights/media/{identifier}/history",
+        response_model=list[MediaInsightSnapshot],
+        dependencies=[Depends(_require_auth)],
+    )
+    def get_media_insight_history(
+        identifier: str,
+        limit: int = Query(default=50, ge=1, le=500),
+    ) -> list[MediaInsightSnapshot]:
+        try:
+            return service.get_media_insight_history(identifier, limit=limit)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
     # Adapters & settings

@@ -35,6 +35,18 @@ Este documento está diseñado para que cualquier agente de IA (Claude Code, Cod
    uv run insta-poster story create --image <ID> --fit pad_blur --now --json
    ```
 
+5. **Consultar métricas (Insights) de cuenta, posts e historias:**
+   ```bash
+   # Sincronizar métricas desde Meta Graph API (incluye historias activas <24h)
+   uv run insta-poster insights sync --days 7 --json
+
+   # Ver ranking de contenido por vistas o interacciones
+   uv run insta-poster insights overview --days 7 --sort views --json
+
+   # Ver detalle e historial de snapshots de un post o historia
+   uv run insta-poster insights show <PUB_OR_MEDIA_ID> --history --json
+   ```
+
 ---
 
 ## 2. REST API (con el servidor corriendo en `http://127.0.0.1:8000`)
@@ -50,6 +62,10 @@ Endpoints principales:
 - `POST /api/publications` (`{"pub_type": "post"|"carousel"|"story", "image_ids": [...], "caption": "...", "hashtags": [...], "fit_mode": "auto"|"pad_blur"|"crop"|"pad_solid", "publish_now": true}`)
 - `POST /api/publications/{id}/publish`
 - `GET /api/publications?status=scheduled`
+- `GET /api/insights?days=7&media_product_type=FEED|STORY|REELS&sort_by=views`
+- `POST /api/insights/sync?days=7&stories_only=false`
+- `GET /api/insights/media/{identifier}/history`
+- `POST /api/publications/{id}/insights/sync`
 
 > **Autenticación REST API:** todos los endpoints `/api/*` (salvo `/api/health`) requieren autenticación. Podés autenticarte de dos formas:
 > 1. **API Key (recomendado para agentes):** creá una clave (`ipk_...`) desde la Web UI (**Usuarios → API Keys**), por CLI (`insta-poster apikey create mi-agente`) o vía `INSTA_POSTER_API_KEY`, y enviala en `X-API-Key: <tu-clave>` o `Authorization: Bearer <tu-clave>`.

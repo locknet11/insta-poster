@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react';
-import { Send, Trash2, Play, RefreshCw, Edit3 } from 'lucide-react';
+import { Send, Trash2, Play, RefreshCw, Edit3, BarChart3, ExternalLink } from 'lucide-react';
 import { api } from '../api.js';
 import { useI18n } from '../i18n.jsx';
 import SchematicCard from './SchematicCard.jsx';
@@ -9,6 +9,24 @@ export default function QueueView({ publications, onEdit, onRefresh, notify }) {
   const [statusFilter, setStatusFilter] = useState('');
   const [typeFilter, setTypeFilter] = useState('');
   const [busyId, setBusyId] = useState(null);
+  const [syncingInsightId, setSyncingInsightId] = useState(null);
+
+  const handleSyncPubInsight = async (pub) => {
+    setSyncingInsightId(pub.id);
+    try {
+      const res = await api.syncPublicationInsights(pub.id);
+      if (res.error_message) {
+        notify(res.error_message, 'error');
+      } else {
+        notify(t('queue.toastInsightSynced'));
+      }
+      await onRefresh();
+    } catch (err) {
+      notify(err.message, 'error');
+    } finally {
+      setSyncingInsightId(null);
+    }
+  };
 
   const filtered = useMemo(() => {
     return publications.filter((p) => {
@@ -163,9 +181,70 @@ export default function QueueView({ publications, onEdit, onRefresh, notify }) {
                         {t('queue.errorPrefix', { error: pub.error_message })}
                       </div>
                     )}
+                    {pub.insights && (
+                      <div className="queue-insight-bar">
+                        <span>
+                          <strong>{pub.insights.views ?? '—'}</strong> {t('insights.kpi.views')}
+                        </span>
+                        <span>
+                          <strong>{pub.insights.reach ?? '—'}</strong> {t('insights.kpi.reach')}
+                        </span>
+                        {pub.pub_type === 'story' ? (
+                          <>
+                            <span>
+                              <strong>{pub.insights.replies ?? '—'}</strong> {t('insights.kpi.replies')}
+                            </span>
+                            <span>
+                              <strong>{pub.insights.navigation ?? '—'}</strong> {t('insights.kpi.navigation')}
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <span>
+                              <strong>{pub.insights.likes ?? '—'}</strong> {t('insights.kpi.likes')}
+                            </span>
+                            <span>
+                              <strong>{pub.insights.comments ?? '—'}</strong> {t('insights.kpi.comments')}
+                            </span>
+                            <span>
+                              <strong>{pub.insights.saved ?? '—'}</strong> {t('insights.kpi.saved')}
+                            </span>
+                          </>
+                        )}
+                        <span>
+                          <strong>{pub.insights.shares ?? '—'}</strong> {t('insights.kpi.shares')}
+                        </span>
+                        {pub.insights.engagement_rate !== null && pub.insights.engagement_rate !== undefined && (
+                          <span className="queue-insight-er">ER {pub.insights.engagement_rate}%</span>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   <div className="row" style={{ gap: 6 }}>
+                    {pub.status === 'published' && pub.external_url && pub.external_url.startsWith('http') && (
+                      <a
+                        href={pub.external_url}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="btn btn-sm"
+                        title={t('insights.openInstagram')}
+                      >
+                        <ExternalLink size={12} strokeWidth={1.5} />
+                      </a>
+                    )}
+                    {pub.status === 'published' && pub.adapter === 'graph_api' && pub.external_id && (
+                      <button
+                        type="button"
+                        className="btn btn-sm"
+                        disabled={syncingInsightId === pub.id}
+                        onClick={() => handleSyncPubInsight(pub)}
+                        title={t('queue.syncInsightsTitle')}
+                      >
+                        <BarChart3 size={12} strokeWidth={1.5} />{' '}
+                        {syncingInsightId === pub.id ? '...' : t('queue.syncInsights')}
+                      </button>
+                    )}
                     {pub.status !== 'published' && (
                       <>
                         <button

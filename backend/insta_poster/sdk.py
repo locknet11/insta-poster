@@ -299,3 +299,65 @@ class InstaPoster:
         if self._service:
             return self._service.get_stats().model_dump()
         return self._request("GET", "/api/stats")
+
+    # ------------------------------------------------------------------
+    # Insights & analytics methods
+    # ------------------------------------------------------------------
+    def sync_insights(
+        self,
+        *,
+        days: int = 7,
+        include_account_media: bool = True,
+        stories_only: bool = False,
+    ) -> dict[str, Any]:
+        if self._service:
+            return self._service.sync_insights(
+                days=days,
+                include_account_media=include_account_media,
+                stories_only=stories_only,
+                actor=self._actor,
+            ).model_dump()
+        return self._request(
+            "POST",
+            "/api/insights/sync",
+            params={
+                "days": days,
+                "include_account_media": str(include_account_media).lower(),
+                "stories_only": str(stories_only).lower(),
+            },
+        )
+
+    def get_insights(
+        self,
+        *,
+        days: int = 7,
+        media_product_type: str | None = None,
+        sort_by: str = "published_at",
+        limit: int = 100,
+    ) -> dict[str, Any]:
+        if self._service:
+            return self._service.get_insights_overview(
+                days=days,
+                media_product_type=media_product_type,
+                sort_by=sort_by,
+                limit=limit,
+            ).model_dump()
+        params: dict[str, Any] = {"days": days, "sort_by": sort_by, "limit": limit}
+        if media_product_type:
+            params["media_product_type"] = media_product_type
+        return self._request("GET", "/api/insights", params=params)
+
+    def get_media_insight(self, identifier: str) -> dict[str, Any]:
+        if self._service:
+            return self._service.get_media_insight(identifier).model_dump()
+        return self._request("GET", f"/api/insights/media/{identifier}")
+
+    def get_media_insight_history(self, identifier: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        if self._service:
+            return [s.model_dump() for s in self._service.get_media_insight_history(identifier, limit=limit)]
+        return self._request("GET", f"/api/insights/media/{identifier}/history", params={"limit": limit})
+
+    def sync_publication_insights(self, identifier: str) -> dict[str, Any]:
+        if self._service:
+            return self._service.sync_publication_insights(identifier, actor=self._actor).model_dump()
+        return self._request("POST", f"/api/insights/media/{identifier}/sync")

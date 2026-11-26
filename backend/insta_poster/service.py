@@ -43,6 +43,8 @@ from insta_poster.image_prep import (
     prepare_for_instagram,
 )
 from insta_poster.models import (
+    AccountDailyPoint,
+    AccountInsights,
     ActivityLogEntry,
     AdapterConfigUpdate,
     AdapterStatus,
@@ -50,6 +52,12 @@ from insta_poster.models import (
     ApiKeyPublic,
     DashboardStats,
     FolderSyncResponse,
+    InsightsOverview,
+    InsightsSummary,
+    InsightsSyncResponse,
+    MediaInsight,
+    MediaInsightSnapshot,
+    MediaInsightSummary,
     PoolImage,
     PoolImageUpdate,
     Publication,
@@ -120,6 +128,8 @@ class InstaPosterService:
             self.db.set_setting("default_adapter", "dry_run")
         if self.db.get_setting("scheduler_enabled") is None:
             self.db.set_setting("scheduler_enabled", True)
+        if self.db.get_setting("insights_auto_sync_minutes") is None:
+            self.db.set_setting("insights_auto_sync_minutes", 30)
         if not self.db.get_setting("media_signing_secret"):
             self.db.set_setting("media_signing_secret", secrets.token_hex(32))
         self.bootstrap_users_from_env()
@@ -534,7 +544,59 @@ class InstaPosterService:
             updated_at=row["updated_at"],
         )
 
-    def _row_to_publication(self, row: Any) -> Publication:
+    def _compute_engagement_rate(
+        self,
+        *,
+        reach: int | None,
+        total_interactions: int | None,
+        likes: int | None = None,
+        comments: int | None = None,
+        saved: int | None = None,
+        shares: int | None = None,
+        replies: int | None = None,
+    ) -> float | None:
+        if not reach or reach <= 0:
+            return None
+        if total_interactions is not None:
+            interactions = total_interactions
+        else:
+            parts = [v for v in (likes, comments, saved, shares, replies) if v is not None]
+            if not parts:
+                return None
+            interactions = sum(parts)
+        return round((interactions / reach) * 100.0, 2)
+
+    def _row_to_media_insight_summary(self, row: Any) -> MediaInsightSummary:
+        nav_bd = json.loads(row["navigation_breakdown"] or "{}")
+        return MediaInsightSummary(
+            external_id=row["external_id"],
+            views=row["views"],
+            reach=row["reach"],
+            likes=row["likes"],
+            comments=row["comments"],
+            saved=row["saved"],
+            shares=row["shares"],
+            replies=row["replies"],
+            total_interactions=row["total_interactions"],
+            follows=row["follows"],
+            profile_visits=row["profile_visits"],
+            navigation=row["navigation"],
+            navigation_breakdown=nav_bd,
+            engagement_rate=self._compute_engagement_rate(
+                reach=row["reach"],
+                total_interactions=row["total_interactions"],
+                likes=row["likes"],
+                comments=row["comments"],
+                saved=row["saved"],
+                shares=row["shares"],
+                replies=row["replies"],
+            ),
+            is_active=bool(row["is_active"]),
+            error_message=row["error_message"],
+            synced_at=row["synced_at"],
+        )
+
+    def _row_to_publication(self, row: Any, insight_row: Any | None = None) -> Publication:
         raw_prepared = json.loads(row["prepared_files"] or "[]")
         prepared_files = [self._resolve_prepared_file(p) for p in raw_prepared]
         hashtags = json.loads(row["hashtags"] or "[]")
@@ -560,6 +622,7 @@ class InstaPosterService:
             created_by=row["created_by"] or "user",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
+            insights=self._row_to_media_insight_summary(insight_row) if insight_row is not None else None,
         )
 
     # ------------------------------------------------------------------
@@ -585,6 +648,13 @@ class InstaPosterService:
         with self.db.connection() as conn:
             existing = conn.execute("SELECT * FROM pool_images WHERE sha256 = ?", (sha,)).fetchone()
             if existing:
+                # Self-heal if the DB record exists but the file was missing on disk
+                dst_existing = self.paths.pool_dir / existing["filename"]
+                if not dst_existing.exists():
+                    shutil.copy2(src, dst_existing)
+                thumb_existing = self.paths.thumbnails_dir / f"{existing['id']}.jpg"
+                if not thumb_existing.exists():
+                    generate_thumbnail(dst_existing, thumb_existing)
                 return self._row_to_pool_image(existing), False
 
         image_id = uuid.uuid4().hex[:12]
@@ -1035,9 +1105,15 @@ class InstaPosterService:
     def get_publication(self, pub_id: str) -> Publication:
         with self.db.connection() as conn:
             row = conn.execute("SELECT * FROM publications WHERE id = ?", (pub_id,)).fetchone()
-        if not row:
-            raise KeyError(f"Publicación no encontrada: {pub_id}")
-        return self._row_to_publication(row)
+            if not row:
+                raise KeyError(f"Publicación no encontrada: {pub_id}")
+            insight_row = None
+            if row["external_id"]:
+                insight_row = conn.execute(
+                    "SELECT * FROM media_insights WHERE external_id = ?",
+                    (row["external_id"],),
+                ).fetchone()
+        return self._row_to_publication(row, insight_row)
 
     def list_publications(
         self,
@@ -1059,7 +1135,16 @@ class InstaPosterService:
         params.append(max(1, min(limit, 500)))
         with self.db.connection() as conn:
             rows = conn.execute(sql, params).fetchall()
-        return [self._row_to_publication(r) for r in rows]
+            ext_ids = [r["external_id"] for r in rows if r["external_id"]]
+            insights_by_ext: dict[str, Any] = {}
+            if ext_ids:
+                placeholders = ",".join("?" for _ in ext_ids)
+                ins_rows = conn.execute(
+                    f"SELECT * FROM media_insights WHERE external_id IN ({placeholders})",
+                    ext_ids,
+                ).fetchall()
+                insights_by_ext = {ir["external_id"]: ir for ir in ins_rows}
+        return [self._row_to_publication(r, insights_by_ext.get(r["external_id"])) for r in rows]
 
     def update_publication(self, pub_id: str, payload: PublicationUpdate, actor: str = "user") -> Publication:
         pub = self.get_publication(pub_id)
@@ -1308,6 +1393,823 @@ class InstaPosterService:
             if _parse_iso(pub.scheduled_at) <= now:
                 processed.append(self.publish_publication(pub.id, actor="scheduler"))
         return processed
+
+    # ------------------------------------------------------------------
+    # Insights & analytics (Meta Graph API + SQLite snapshots)
+    # ------------------------------------------------------------------
+    def get_insights_auto_sync_minutes(self) -> int:
+        raw = self.db.get_setting("insights_auto_sync_minutes", 30)
+        try:
+            return max(5, min(int(raw), 1440))
+        except (TypeError, ValueError):
+            return 30
+
+    def _row_to_account_insights(self, row: Any) -> AccountInsights:
+        raw_series = json.loads(row["daily_series"] or "[]")
+        return AccountInsights(
+            period_days=int(row["period_days"]),
+            ig_user_id=row["ig_user_id"] or "",
+            username=row["username"] or "",
+            name=row["name"] or "",
+            followers_count=row["followers_count"],
+            follows_count=row["follows_count"],
+            media_count=row["media_count"],
+            totals=json.loads(row["totals"] or "{}"),
+            daily_series=[AccountDailyPoint(**pt) for pt in raw_series if isinstance(pt, dict)],
+            error_message=row["error_message"],
+            synced_at=row["synced_at"],
+        )
+
+    def _row_to_media_insight(
+        self,
+        row: Any,
+        *,
+        pub_type: str | None = None,
+        local_thumb_url: str | None = None,
+        snapshots_count: int = 0,
+    ) -> MediaInsight:
+        nav_bd = json.loads(row["navigation_breakdown"] or "{}")
+        extra = json.loads(row["extra_metrics"] or "{}")
+        media_product = (row["media_product_type"] or "FEED").upper()
+        media_type = (row["media_type"] or "IMAGE").upper()
+        inferred_pub_type = pub_type
+        if not inferred_pub_type:
+            if media_product == "STORY":
+                inferred_pub_type = "story"
+            elif media_type == "CAROUSEL_ALBUM":
+                inferred_pub_type = "carousel"
+            elif media_product == "REELS":
+                inferred_pub_type = "reel"
+            else:
+                inferred_pub_type = "post"
+        return MediaInsight(
+            external_id=row["external_id"],
+            publication_id=row["publication_id"],
+            pub_type=inferred_pub_type,
+            media_type=media_type,
+            media_product_type=media_product,
+            caption=row["caption"] or "",
+            permalink=row["permalink"],
+            thumbnail_url=local_thumb_url or row["thumbnail_url"],
+            published_at=row["published_at"],
+            is_active=bool(row["is_active"]),
+            views=row["views"],
+            reach=row["reach"],
+            likes=row["likes"],
+            comments=row["comments"],
+            saved=row["saved"],
+            shares=row["shares"],
+            replies=row["replies"],
+            total_interactions=row["total_interactions"],
+            follows=row["follows"],
+            profile_visits=row["profile_visits"],
+            profile_activity=row["profile_activity"],
+            navigation=row["navigation"],
+            navigation_breakdown=nav_bd,
+            engagement_rate=self._compute_engagement_rate(
+                reach=row["reach"],
+                total_interactions=row["total_interactions"],
+                likes=row["likes"],
+                comments=row["comments"],
+                saved=row["saved"],
+                shares=row["shares"],
+                replies=row["replies"],
+            ),
+            extra_metrics=extra,
+            error_message=row["error_message"],
+            synced_at=row["synced_at"],
+            snapshots_count=snapshots_count,
+        )
+
+    def _upsert_media_insight(
+        self,
+        conn: sqlite3.Connection,
+        *,
+        external_id: str,
+        publication_id: str | None,
+        media_type: str,
+        media_product_type: str,
+        caption: str,
+        permalink: str | None,
+        thumbnail_url: str | None,
+        published_at: str | None,
+        is_active: bool,
+        metrics: dict[str, int],
+        navigation_breakdown: dict[str, int],
+        extra_metrics: dict[str, Any],
+        error_message: str | None,
+        now: str,
+    ) -> None:
+        existing = conn.execute(
+            "SELECT * FROM media_insights WHERE external_id = ?",
+            (external_id,),
+        ).fetchone()
+
+        def pick_int(col: str) -> int | None:
+            if col in metrics and metrics[col] is not None:
+                return int(metrics[col])
+            return existing[col] if existing is not None else None
+
+        views = pick_int("views")
+        reach = pick_int("reach")
+        likes = pick_int("likes")
+        comments = pick_int("comments")
+        saved = pick_int("saved")
+        shares = pick_int("shares")
+        replies = pick_int("replies")
+        total_interactions = pick_int("total_interactions")
+        follows = pick_int("follows")
+        profile_visits = pick_int("profile_visits")
+        profile_activity = pick_int("profile_activity")
+        navigation = pick_int("navigation")
+
+        merged_nav = navigation_breakdown or (
+            json.loads(existing["navigation_breakdown"] or "{}") if existing is not None else {}
+        )
+        merged_extra = {
+            **(json.loads(existing["extra_metrics"] or "{}") if existing is not None else {}),
+            **(extra_metrics or {}),
+        }
+
+        final_pub_id = publication_id or (existing["publication_id"] if existing is not None else None)
+        final_caption = caption or (existing["caption"] if existing is not None else "")
+        final_permalink = permalink or (existing["permalink"] if existing is not None else None)
+        final_thumb = thumbnail_url or (existing["thumbnail_url"] if existing is not None else None)
+        final_published_at = published_at or (existing["published_at"] if existing is not None else None)
+        final_media_type = (media_type or (existing["media_type"] if existing is not None else "IMAGE")).upper()
+        final_product = (
+            media_product_type or (existing["media_product_type"] if existing is not None else "FEED")
+        ).upper()
+        created_at = existing["created_at"] if existing is not None else now
+
+        conn.execute(
+            """
+            INSERT INTO media_insights (
+                external_id, publication_id, media_type, media_product_type, caption, permalink,
+                thumbnail_url, published_at, is_active,
+                views, reach, likes, comments, saved, shares, replies,
+                total_interactions, follows, profile_visits, profile_activity,
+                navigation, navigation_breakdown, extra_metrics, error_message,
+                synced_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(external_id) DO UPDATE SET
+                publication_id = excluded.publication_id,
+                media_type = excluded.media_type,
+                media_product_type = excluded.media_product_type,
+                caption = excluded.caption,
+                permalink = excluded.permalink,
+                thumbnail_url = excluded.thumbnail_url,
+                published_at = excluded.published_at,
+                is_active = excluded.is_active,
+                views = excluded.views,
+                reach = excluded.reach,
+                likes = excluded.likes,
+                comments = excluded.comments,
+                saved = excluded.saved,
+                shares = excluded.shares,
+                replies = excluded.replies,
+                total_interactions = excluded.total_interactions,
+                follows = excluded.follows,
+                profile_visits = excluded.profile_visits,
+                profile_activity = excluded.profile_activity,
+                navigation = excluded.navigation,
+                navigation_breakdown = excluded.navigation_breakdown,
+                extra_metrics = excluded.extra_metrics,
+                error_message = excluded.error_message,
+                synced_at = excluded.synced_at,
+                updated_at = excluded.updated_at
+            """,
+            (
+                external_id,
+                final_pub_id,
+                final_media_type,
+                final_product,
+                final_caption,
+                final_permalink,
+                final_thumb,
+                final_published_at,
+                1 if is_active else 0,
+                views,
+                reach,
+                likes,
+                comments,
+                saved,
+                shares,
+                replies,
+                total_interactions,
+                follows,
+                profile_visits,
+                profile_activity,
+                navigation,
+                json.dumps(merged_nav, ensure_ascii=False),
+                json.dumps(merged_extra, ensure_ascii=False),
+                error_message,
+                now,
+                created_at,
+                now,
+            ),
+        )
+
+        # Record a historical snapshot if we got real metrics and values changed (or >= 30 min elapsed)
+        has_any_metric = any(
+            v is not None for v in (views, reach, likes, comments, saved, shares, replies, total_interactions)
+        )
+        if not has_any_metric:
+            return
+
+        last_snap = conn.execute(
+            "SELECT * FROM media_insight_snapshots WHERE external_id = ? ORDER BY id DESC LIMIT 1",
+            (external_id,),
+        ).fetchone()
+
+        should_snapshot = last_snap is None
+        if last_snap is not None:
+            changed = any(
+                (
+                    last_snap["views"] != views,
+                    last_snap["reach"] != reach,
+                    last_snap["likes"] != likes,
+                    last_snap["comments"] != comments,
+                    last_snap["saved"] != saved,
+                    last_snap["shares"] != shares,
+                    last_snap["replies"] != replies,
+                    last_snap["total_interactions"] != total_interactions,
+                    last_snap["navigation"] != navigation,
+                )
+            )
+            elapsed_ok = False
+            try:
+                elapsed_ok = (_parse_iso(now) - _parse_iso(last_snap["captured_at"])) >= timedelta(minutes=30)
+            except Exception:
+                elapsed_ok = True
+            should_snapshot = changed or elapsed_ok
+
+        if should_snapshot:
+            conn.execute(
+                """
+                INSERT INTO media_insight_snapshots (
+                    external_id, views, reach, likes, comments, saved, shares, replies,
+                    total_interactions, follows, profile_visits, navigation,
+                    navigation_breakdown, captured_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    external_id,
+                    views,
+                    reach,
+                    likes,
+                    comments,
+                    saved,
+                    shares,
+                    replies,
+                    total_interactions,
+                    follows,
+                    profile_visits,
+                    navigation,
+                    json.dumps(merged_nav, ensure_ascii=False),
+                    now,
+                ),
+            )
+
+    def _get_graph_adapter_for_insights(self) -> GraphAPIAdapter:
+        adapter = self.get_adapter("graph_api")
+        assert isinstance(adapter, GraphAPIAdapter)
+        if not adapter.can_fetch_insights():
+            raise ValueError(
+                "El adaptador graph_api no está configurado para consultar métricas "
+                "(falta Access Token o IG User ID en Configuración)."
+            )
+        return adapter
+
+    def sync_insights(
+        self,
+        *,
+        days: int = 7,
+        include_account_media: bool = True,
+        stories_only: bool = False,
+        actor: str = "user",
+    ) -> InsightsSyncResponse:
+        """Synchronize account, feed/carousel/reel, and active 24h story insights from Meta Graph API."""
+        adapter = self._get_graph_adapter_for_insights()
+        clamped_days = max(1, min(int(days), 30))
+        now = utcnow_iso()
+        errors: list[str] = []
+        account_model: AccountInsights | None = None
+
+        # 1. Account insights
+        if not stories_only:
+            try:
+                acc = adapter.fetch_account_insights(days=clamped_days)
+                with self.db.connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO account_insights (
+                            period_days, ig_user_id, username, name,
+                            followers_count, follows_count, media_count,
+                            totals, daily_series, error_message, synced_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(period_days) DO UPDATE SET
+                            ig_user_id = excluded.ig_user_id,
+                            username = excluded.username,
+                            name = excluded.name,
+                            followers_count = excluded.followers_count,
+                            follows_count = excluded.follows_count,
+                            media_count = excluded.media_count,
+                            totals = excluded.totals,
+                            daily_series = excluded.daily_series,
+                            error_message = excluded.error_message,
+                            synced_at = excluded.synced_at
+                        """,
+                        (
+                            acc["period_days"],
+                            acc["ig_user_id"],
+                            acc["username"],
+                            acc["name"],
+                            acc["followers_count"],
+                            acc["follows_count"],
+                            acc["media_count"],
+                            json.dumps(acc["totals"], ensure_ascii=False),
+                            json.dumps(acc["daily_series"], ensure_ascii=False),
+                            acc["error_message"],
+                            now,
+                        ),
+                    )
+                    acc_row = conn.execute(
+                        "SELECT * FROM account_insights WHERE period_days = ?",
+                        (acc["period_days"],),
+                    ).fetchone()
+                account_model = self._row_to_account_insights(acc_row)
+                if acc.get("error_message"):
+                    errors.append(f"Cuenta: {acc['error_message']}")
+            except Exception as exc:
+                errors.append(f"Cuenta: {exc}")
+
+        # Build local publication lookup by external_id
+        with self.db.connection() as conn:
+            pub_rows = conn.execute(
+                "SELECT * FROM publications WHERE status = 'published' AND adapter = 'graph_api' AND external_id IS NOT NULL"
+            ).fetchall()
+        pubs_by_ext = {str(r["external_id"]): r for r in pub_rows if r["external_id"]}
+
+        synced_stories = 0
+        synced_media = 0
+        active_story_ids: set[str] = set()
+
+        # 2. Active stories (<24h) — capture snapshots before Meta expires them
+        try:
+            active_stories = adapter.fetch_active_stories()
+            for st in active_stories:
+                ext_id = str(st.get("id") or "").strip()
+                if not ext_id:
+                    continue
+                active_story_ids.add(ext_id)
+                local_pub = pubs_by_ext.get(ext_id)
+                try:
+                    res = adapter.fetch_media_insights(
+                        ext_id,
+                        media_product_type="STORY",
+                        media_type=str(st.get("media_type") or "IMAGE"),
+                    )
+                    thumb = st.get("thumbnail_url") or st.get("media_url")
+                    with self.db.connection() as conn:
+                        self._upsert_media_insight(
+                            conn,
+                            external_id=ext_id,
+                            publication_id=local_pub["id"] if local_pub else None,
+                            media_type=str(st.get("media_type") or "IMAGE"),
+                            media_product_type="STORY",
+                            caption=str(st.get("caption") or ""),
+                            permalink=st.get("permalink") or (local_pub["external_url"] if local_pub else None),
+                            thumbnail_url=thumb,
+                            published_at=st.get("timestamp") or (local_pub["published_at"] if local_pub else None),
+                            is_active=not res.get("expired", False),
+                            metrics=res["metrics"],
+                            navigation_breakdown=res["navigation_breakdown"],
+                            extra_metrics=res["extra_metrics"],
+                            error_message=res["error_message"],
+                            now=now,
+                        )
+                    synced_stories += 1
+                    if res.get("error_message"):
+                        errors.append(f"Story {ext_id}: {res['error_message']}")
+                except Exception as exc:
+                    errors.append(f"Story {ext_id}: {exc}")
+
+            # Mark previously active stories no longer live as archived/expired (preserving their metrics)
+            with self.db.connection() as conn:
+                if active_story_ids:
+                    placeholders = ",".join("?" for _ in active_story_ids)
+                    conn.execute(
+                        f"""
+                        UPDATE media_insights
+                        SET is_active = 0, updated_at = ?
+                        WHERE media_product_type = 'STORY' AND is_active = 1
+                          AND external_id NOT IN ({placeholders})
+                        """,
+                        [now, *active_story_ids],
+                    )
+                else:
+                    conn.execute(
+                        """
+                        UPDATE media_insights
+                        SET is_active = 0, updated_at = ?
+                        WHERE media_product_type = 'STORY' AND is_active = 1
+                        """,
+                        (now,),
+                    )
+        except Exception as exc:
+            errors.append(f"Historias activas: {exc}")
+
+        # 3. Feed posts, carousels, and reels
+        seen_media_ids: set[str] = set(active_story_ids)
+        if not stories_only:
+            if include_account_media:
+                try:
+                    media_list = adapter.fetch_account_media(limit=50)
+                    for item in media_list:
+                        ext_id = str(item.get("id") or "").strip()
+                        if not ext_id:
+                            continue
+                        seen_media_ids.add(ext_id)
+                        local_pub = pubs_by_ext.get(ext_id)
+                        m_type = str(item.get("media_type") or "IMAGE")
+                        m_prod = str(item.get("media_product_type") or "FEED")
+                        try:
+                            res = adapter.fetch_media_insights(
+                                ext_id,
+                                media_product_type=m_prod,
+                                media_type=m_type,
+                                fallback_likes=item.get("like_count"),
+                                fallback_comments=item.get("comments_count"),
+                            )
+                            thumb = item.get("thumbnail_url") or item.get("media_url")
+                            with self.db.connection() as conn:
+                                self._upsert_media_insight(
+                                    conn,
+                                    external_id=ext_id,
+                                    publication_id=local_pub["id"] if local_pub else None,
+                                    media_type=m_type,
+                                    media_product_type=m_prod,
+                                    caption=str(
+                                        item.get("caption")
+                                        or (local_pub["caption"] if local_pub else "")
+                                    ),
+                                    permalink=item.get("permalink")
+                                    or (local_pub["external_url"] if local_pub else None),
+                                    thumbnail_url=thumb,
+                                    published_at=item.get("timestamp")
+                                    or (local_pub["published_at"] if local_pub else None),
+                                    is_active=not res.get("expired", False),
+                                    metrics=res["metrics"],
+                                    navigation_breakdown=res["navigation_breakdown"],
+                                    extra_metrics=res["extra_metrics"],
+                                    error_message=res["error_message"],
+                                    now=now,
+                                )
+                            synced_media += 1
+                            if res.get("error_message"):
+                                errors.append(f"Media {ext_id}: {res['error_message']}")
+                        except Exception as exc:
+                            errors.append(f"Media {ext_id}: {exc}")
+                except Exception as exc:
+                    errors.append(f"Publicaciones de cuenta: {exc}")
+
+            # Sync any local published feed/carousel publications missed by the media page
+            for ext_id, local_pub in pubs_by_ext.items():
+                if ext_id in seen_media_ids or local_pub["pub_type"] == "story":
+                    continue
+                m_type = "CAROUSEL_ALBUM" if local_pub["pub_type"] == "carousel" else "IMAGE"
+                try:
+                    res = adapter.fetch_media_insights(
+                        ext_id,
+                        media_product_type="FEED",
+                        media_type=m_type,
+                        include_metadata=True,
+                    )
+                    meta = res.get("metadata") or {}
+                    with self.db.connection() as conn:
+                        self._upsert_media_insight(
+                            conn,
+                            external_id=ext_id,
+                            publication_id=local_pub["id"],
+                            media_type=str(meta.get("media_type") or m_type),
+                            media_product_type=str(meta.get("media_product_type") or "FEED"),
+                            caption=str(meta.get("caption") or local_pub["caption"] or ""),
+                            permalink=meta.get("permalink") or local_pub["external_url"],
+                            thumbnail_url=meta.get("thumbnail_url") or meta.get("media_url"),
+                            published_at=meta.get("timestamp") or local_pub["published_at"],
+                            is_active=not res.get("expired", False),
+                            metrics=res["metrics"],
+                            navigation_breakdown=res["navigation_breakdown"],
+                            extra_metrics=res["extra_metrics"],
+                            error_message=res["error_message"],
+                            now=now,
+                        )
+                    synced_media += 1
+                except Exception as exc:
+                    errors.append(f"Pub {local_pub['id']}: {exc}")
+
+        self.db.set_setting("insights_last_sync_at", now)
+        self.db.log_activity(
+            "insights.sync",
+            actor=actor,
+            entity_type="insights",
+            details={
+                "days": clamped_days,
+                "stories_only": stories_only,
+                "synced_media": synced_media,
+                "synced_stories": synced_stories,
+                "errors": len(errors),
+            },
+        )
+        return InsightsSyncResponse(
+            synced_at=now,
+            period_days=clamped_days,
+            account=account_model,
+            synced_media_count=synced_media,
+            synced_stories_count=synced_stories,
+            errors=errors,
+        )
+
+    def _resolve_media_external_id(self, identifier: str) -> tuple[str, Any | None]:
+        """Resolve either a local publication_id or a Meta external_id."""
+        with self.db.connection() as conn:
+            pub = conn.execute("SELECT * FROM publications WHERE id = ?", (identifier,)).fetchone()
+            if pub is not None:
+                if not pub["external_id"]:
+                    raise ValueError(f"La publicación '{identifier}' todavía no fue publicada en Instagram.")
+                if pub["adapter"] != "graph_api":
+                    raise ValueError(
+                        f"La publicación '{identifier}' usó '{pub['adapter']}' (simulación local) y no tiene métricas en Meta."
+                    )
+                return str(pub["external_id"]), pub
+            existing = conn.execute(
+                "SELECT * FROM media_insights WHERE external_id = ?",
+                (identifier,),
+            ).fetchone()
+            if existing is not None:
+                linked_pub = None
+                if existing["publication_id"]:
+                    linked_pub = conn.execute(
+                        "SELECT * FROM publications WHERE id = ?",
+                        (existing["publication_id"],),
+                    ).fetchone()
+                return str(existing["external_id"]), linked_pub
+            pub_by_ext = conn.execute(
+                "SELECT * FROM publications WHERE external_id = ?",
+                (identifier,),
+            ).fetchone()
+            if pub_by_ext is not None:
+                return str(identifier), pub_by_ext
+        raise KeyError(f"Métrica o publicación no encontrada: {identifier}")
+
+    def sync_publication_insights(self, identifier: str, *, actor: str = "user") -> MediaInsight:
+        """Refresh insights on demand for a single publication (by local ID or Meta external_id)."""
+        adapter = self._get_graph_adapter_for_insights()
+        external_id, local_pub = self._resolve_media_external_id(identifier)
+        now = utcnow_iso()
+
+        with self.db.connection() as conn:
+            existing = conn.execute(
+                "SELECT * FROM media_insights WHERE external_id = ?",
+                (external_id,),
+            ).fetchone()
+
+        if existing is not None:
+            product = str(existing["media_product_type"] or "FEED")
+            m_type = str(existing["media_type"] or "IMAGE")
+        elif local_pub is not None:
+            product = "STORY" if local_pub["pub_type"] == "story" else "FEED"
+            m_type = "CAROUSEL_ALBUM" if local_pub["pub_type"] == "carousel" else "IMAGE"
+        else:
+            product = "FEED"
+            m_type = "IMAGE"
+
+        res = adapter.fetch_media_insights(
+            external_id,
+            media_product_type=product,
+            media_type=m_type,
+            include_metadata=True,
+        )
+        meta = res.get("metadata") or {}
+        with self.db.connection() as conn:
+            self._upsert_media_insight(
+                conn,
+                external_id=external_id,
+                publication_id=local_pub["id"] if local_pub else (existing["publication_id"] if existing else None),
+                media_type=str(meta.get("media_type") or m_type),
+                media_product_type=str(meta.get("media_product_type") or product),
+                caption=str(meta.get("caption") or (local_pub["caption"] if local_pub else "")),
+                permalink=meta.get("permalink") or (local_pub["external_url"] if local_pub else None),
+                thumbnail_url=meta.get("thumbnail_url") or meta.get("media_url"),
+                published_at=meta.get("timestamp") or (local_pub["published_at"] if local_pub else None),
+                is_active=not res.get("expired", False),
+                metrics=res["metrics"],
+                navigation_breakdown=res["navigation_breakdown"],
+                extra_metrics=res["extra_metrics"],
+                error_message=res["error_message"],
+                now=now,
+            )
+
+        self.db.log_activity(
+            "insights.sync_item",
+            actor=actor,
+            entity_type="media_insight",
+            entity_id=external_id,
+            details={"publication_id": local_pub["id"] if local_pub else None},
+        )
+        return self.get_media_insight(external_id)
+
+    def _local_thumb_for_pub(self, pub_row: Any | None) -> str | None:
+        if pub_row is None:
+            return None
+        raw_prepared = json.loads(pub_row["prepared_files"] or "[]")
+        if raw_prepared:
+            resolved = self._resolve_prepared_file(raw_prepared[0])
+            if resolved and Path(resolved).exists():
+                return f"/media/prepared/{Path(resolved).name}"
+        return None
+
+    def get_media_insight(self, identifier: str) -> MediaInsight:
+        external_id, local_pub = self._resolve_media_external_id(identifier)
+        with self.db.connection() as conn:
+            row = conn.execute(
+                "SELECT * FROM media_insights WHERE external_id = ?",
+                (external_id,),
+            ).fetchone()
+            if not row:
+                raise KeyError(f"Sin métricas sincronizadas para: {identifier}")
+            snap_count_row = conn.execute(
+                "SELECT COUNT(*) AS c FROM media_insight_snapshots WHERE external_id = ?",
+                (external_id,),
+            ).fetchone()
+        return self._row_to_media_insight(
+            row,
+            pub_type=local_pub["pub_type"] if local_pub else None,
+            local_thumb_url=self._local_thumb_for_pub(local_pub),
+            snapshots_count=int(snap_count_row["c"]) if snap_count_row else 0,
+        )
+
+    def get_media_insight_history(self, identifier: str, limit: int = 50) -> list[MediaInsightSnapshot]:
+        external_id, _ = self._resolve_media_external_id(identifier)
+        with self.db.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT * FROM media_insight_snapshots
+                WHERE external_id = ?
+                ORDER BY captured_at DESC, id DESC
+                LIMIT ?
+                """,
+                (external_id, max(1, min(limit, 500))),
+            ).fetchall()
+        return [
+            MediaInsightSnapshot(
+                id=r["id"],
+                external_id=r["external_id"],
+                views=r["views"],
+                reach=r["reach"],
+                likes=r["likes"],
+                comments=r["comments"],
+                saved=r["saved"],
+                shares=r["shares"],
+                replies=r["replies"],
+                total_interactions=r["total_interactions"],
+                follows=r["follows"],
+                profile_visits=r["profile_visits"],
+                navigation=r["navigation"],
+                navigation_breakdown=json.loads(r["navigation_breakdown"] or "{}"),
+                captured_at=r["captured_at"],
+            )
+            for r in rows
+        ]
+
+    def get_insights_overview(
+        self,
+        *,
+        days: int = 7,
+        media_product_type: str | None = None,
+        sort_by: str = "published_at",
+        limit: int = 100,
+    ) -> InsightsOverview:
+        clamped_days = max(1, min(int(days), 30))
+        graph_adapter = self.get_adapter("graph_api")
+        assert isinstance(graph_adapter, GraphAPIAdapter)
+
+        with self.db.connection() as conn:
+            acc_row = conn.execute(
+                "SELECT * FROM account_insights WHERE period_days = ?",
+                (clamped_days,),
+            ).fetchone()
+            if acc_row is None:
+                acc_row = conn.execute(
+                    "SELECT * FROM account_insights ORDER BY synced_at DESC LIMIT 1"
+                ).fetchone()
+
+            clauses: list[str] = []
+            params: list[Any] = []
+            if media_product_type:
+                clauses.append("UPPER(media_product_type) = ?")
+                params.append(media_product_type.strip().upper())
+
+            where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+            rows = conn.execute(
+                f"SELECT * FROM media_insights {where} ORDER BY COALESCE(published_at, synced_at) DESC",
+                params,
+            ).fetchall()
+
+            pub_rows = conn.execute("SELECT id, pub_type, prepared_files, external_id FROM publications").fetchall()
+            pubs_by_id = {r["id"]: r for r in pub_rows}
+            pubs_by_ext = {r["external_id"]: r for r in pub_rows if r["external_id"]}
+
+            snap_rows = conn.execute(
+                "SELECT external_id, COUNT(*) AS c FROM media_insight_snapshots GROUP BY external_id"
+            ).fetchall()
+            snap_counts = {r["external_id"]: int(r["c"]) for r in snap_rows}
+
+        items: list[MediaInsight] = []
+        for r in rows:
+            pub = pubs_by_id.get(r["publication_id"]) if r["publication_id"] else pubs_by_ext.get(r["external_id"])
+            items.append(
+                self._row_to_media_insight(
+                    r,
+                    pub_type=pub["pub_type"] if pub else None,
+                    local_thumb_url=self._local_thumb_for_pub(pub),
+                    snapshots_count=snap_counts.get(r["external_id"], 0),
+                )
+            )
+
+        sort_map = {
+            "published_at": lambda x: (x.published_at or "", x.synced_at),
+            "views": lambda x: (x.views if x.views is not None else -1, x.published_at or ""),
+            "reach": lambda x: (x.reach if x.reach is not None else -1, x.published_at or ""),
+            "total_interactions": lambda x: (
+                x.total_interactions if x.total_interactions is not None else -1,
+                x.published_at or "",
+            ),
+            "likes": lambda x: (x.likes if x.likes is not None else -1, x.published_at or ""),
+            "saved": lambda x: (x.saved if x.saved is not None else -1, x.published_at or ""),
+            "shares": lambda x: (x.shares if x.shares is not None else -1, x.published_at or ""),
+            "profile_visits": lambda x: (
+                x.profile_visits if x.profile_visits is not None else -1,
+                x.published_at or "",
+            ),
+        }
+        key_fn = sort_map.get(sort_by, sort_map["published_at"])
+        items.sort(key=key_fn, reverse=True)
+        capped_items = items[: max(1, min(limit, 500))]
+
+        ers = [i.engagement_rate for i in items if i.engagement_rate is not None]
+        summary = InsightsSummary(
+            total_items=len(items),
+            feed_count=sum(1 for i in items if i.media_product_type == "FEED"),
+            story_count=sum(1 for i in items if i.media_product_type == "STORY"),
+            active_stories_count=sum(1 for i in items if i.media_product_type == "STORY" and i.is_active),
+            reels_count=sum(1 for i in items if i.media_product_type == "REELS"),
+            total_views=sum(i.views or 0 for i in items),
+            total_reach=sum(i.reach or 0 for i in items),
+            total_likes=sum(i.likes or 0 for i in items),
+            total_comments=sum(i.comments or 0 for i in items),
+            total_saved=sum(i.saved or 0 for i in items),
+            total_shares=sum(i.shares or 0 for i in items),
+            total_replies=sum(i.replies or 0 for i in items),
+            total_interactions=sum(i.total_interactions or 0 for i in items),
+            total_profile_visits=sum(i.profile_visits or 0 for i in items),
+            total_follows=sum(i.follows or 0 for i in items),
+            avg_engagement_rate=round(sum(ers) / len(ers), 2) if ers else None,
+        )
+
+        last_sync = self.db.get_setting("insights_last_sync_at")
+        if not last_sync and acc_row is not None:
+            last_sync = acc_row["synced_at"]
+
+        return InsightsOverview(
+            account=self._row_to_account_insights(acc_row) if acc_row is not None else None,
+            summary=summary,
+            items=capped_items,
+            last_synced_at=str(last_sync) if last_sync else None,
+            adapter_configured=graph_adapter.can_fetch_insights(),
+            auto_sync_interval_minutes=self.get_insights_auto_sync_minutes(),
+        )
+
+    def run_periodic_insights_sync(self) -> InsightsSyncResponse | None:
+        """Auto-sync insights periodically so active 24h stories are snapshotted before expiring."""
+        if not self.is_scheduler_enabled():
+            return None
+        graph_adapter = self.get_adapter("graph_api")
+        assert isinstance(graph_adapter, GraphAPIAdapter)
+        if not graph_adapter.can_fetch_insights():
+            return None
+
+        interval_min = self.get_insights_auto_sync_minutes()
+        last_sync = self.db.get_setting("insights_last_sync_at")
+        if last_sync:
+            try:
+                if (datetime.now(timezone.utc) - _parse_iso(str(last_sync))) < timedelta(minutes=interval_min):
+                    return None
+            except Exception:
+                pass
+
+        return self.sync_insights(days=7, include_account_media=True, stories_only=False, actor="scheduler")
 
     # ------------------------------------------------------------------
     # Stats & activity logs

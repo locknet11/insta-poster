@@ -17,6 +17,10 @@ Built with FastAPI, SQLite, Pillow, and React (styled with the **EDKA Schematic 
 - **Swappable Publishing Adapters**
   - `dry_run` *(default)*: safe local simulation that writes rendered JPEGs and JSON receipts to `data/published_dry_run/` without touching Instagram.
   - `graph_api` *(official Meta API)*: publishes posts, carousels, and stories via `graph.instagram.com` (Instagram Login, no Facebook Page required) or `graph.facebook.com`. Supports temporary hosting via ImgBB or direct HTTPS delivery with automatically HMAC-signed `/media/prepared/*` URLs.
+- **Instagram Insights & 24h Story Snapshots**
+  - Pulls account telemetry (followers, 7d/14d/30d views, daily reach time series, interactions, profile visits) and per-media metrics (`views`, `reach`, `likes`, `comments`, `saved`, `shares`, `replies`, `profile_visits`, engagement rate, and Story navigation breakdowns: `tap_forward`, `tap_back`, `swipe_forward`, `tap_exit`).
+  - Automatically snapshots active Stories (<24h) into SQLite via the background scheduler so historical story metrics are preserved after Meta expires them.
+  - Available across Web UI (**Insights** tab + inline metrics in **Queue & History** + Dashboard overview), REST API (`/api/insights*`), CLI (`insta-poster insights ...`), and Python SDK.
 - **Built-In Multi-User Authentication (Dokploy-Ready)**
   - Protects the Web UI, REST API (`/api/*`), OpenAPI/Swagger (`/docs`), and all media endpoints (`/media/*`). Only `/api/health` remains public for healthchecks.
   - Single-tier multi-user model (all users share full access), `scrypt` password hashing, SQLite-backed `HttpOnly` session cookies (auto-`Secure` behind Traefik/HTTPS), login rate limiting, plus `X-API-Key` and `Authorization: Bearer` support for AI agents.

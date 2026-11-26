@@ -5,13 +5,14 @@ import {
   Images,
   Sparkles,
   CalendarClock,
+  BarChart3,
   Terminal,
   Users,
   LogOut,
 } from 'lucide-react';
 import { LanguageSwitcher, useI18n } from '../i18n.jsx';
 
-export default function Sidebar({ activeTab, onSelect, stats, currentUser, onLogout }) {
+export default function Sidebar({ activeTab, onSelect, stats, insights, currentUser, onLogout }) {
   const { t } = useI18n();
 
   const nav = [
@@ -19,6 +20,12 @@ export default function Sidebar({ activeTab, onSelect, stats, currentUser, onLog
     { id: 'pool', label: t('sidebar.nav.pool'), icon: Images, badge: stats?.pool_available ?? null },
     { id: 'composer', label: t('sidebar.nav.composer'), icon: Sparkles },
     { id: 'queue', label: t('sidebar.nav.queue'), icon: CalendarClock, badge: stats?.publications_scheduled ?? null },
+    {
+      id: 'insights',
+      label: t('sidebar.nav.insights'),
+      icon: BarChart3,
+      badge: insights?.summary?.total_items ? insights.summary.total_items : null,
+    },
     { id: 'settings', label: t('sidebar.nav.settings'), icon: Terminal },
     { id: 'users', label: t('sidebar.nav.users'), icon: Users },
   ];

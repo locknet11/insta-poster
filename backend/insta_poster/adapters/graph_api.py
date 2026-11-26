@@ -13,6 +13,105 @@ from insta_poster.auth import sign_media_filename
 
 VALID_GRAPH_HOSTS = {"graph.instagram.com", "graph.facebook.com"}
 
+ACCOUNT_TIMESERIES_METRICS = ("reach", "follower_count")
+ACCOUNT_TOTAL_METRICS = (
+    "views",
+    "accounts_engaged",
+    "total_interactions",
+    "profile_views",
+    "likes",
+    "comments",
+    "saves",
+    "shares",
+    "follows_and_unfollows",
+    "profile_links_taps",
+)
+FEED_INSIGHT_METRICS = (
+    "views",
+    "reach",
+    "saved",
+    "likes",
+    "comments",
+    "shares",
+    "total_interactions",
+    "follows",
+    "profile_visits",
+    "profile_activity",
+)
+REELS_INSIGHT_METRICS = (
+    "views",
+    "reach",
+    "saved",
+    "likes",
+    "comments",
+    "shares",
+    "total_interactions",
+    "ig_reels_avg_watch_time",
+    "ig_reels_video_view_total_time",
+)
+STORY_INSIGHT_METRICS = (
+    "views",
+    "reach",
+    "replies",
+    "shares",
+    "total_interactions",
+    "navigation",
+    "follows",
+    "profile_visits",
+    "profile_activity",
+)
+MEDIA_LIST_FIELDS = (
+    "id,caption,media_type,media_product_type,like_count,comments_count,"
+    "timestamp,permalink,thumbnail_url,media_url"
+)
+STORY_LIST_FIELDS = "id,caption,media_type,media_product_type,timestamp,permalink,thumbnail_url,media_url"
+
+
+def _extract_metric_int(item: dict[str, Any]) -> int | None:
+    total_val = item.get("total_value")
+    if isinstance(total_val, dict) and total_val.get("value") is not None:
+        try:
+            return int(total_val["value"])
+        except (TypeError, ValueError):
+            pass
+    values = item.get("values")
+    if isinstance(values, list) and values:
+        first = values[0]
+        if isinstance(first, dict) and first.get("value") is not None:
+            try:
+                return int(first["value"])
+            except (TypeError, ValueError):
+                pass
+    return None
+
+
+def _extract_navigation_breakdown(data: list[dict[str, Any]]) -> dict[str, int]:
+    breakdown: dict[str, int] = {}
+    for item in data:
+        if item.get("name") != "navigation":
+            continue
+        total_val = item.get("total_value")
+        if not isinstance(total_val, dict):
+            continue
+        for bd in total_val.get("breakdowns") or []:
+            for res in bd.get("results") or []:
+                dims = res.get("dimension_values") or []
+                if not dims:
+                    continue
+                key = str(dims[0]).strip().lower()
+                try:
+                    breakdown[key] = int(res.get("value", 0))
+                except (TypeError, ValueError):
+                    continue
+    return breakdown
+
+
+def _parse_graph_error(status_code: int, payload: dict[str, Any], raw_text: str) -> tuple[int | None, int | None, str]:
+    err = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(err, dict):
+        return err.get("code"), err.get("error_subcode"), str(err.get("message") or raw_text)
+    return None, None, raw_text or f"HTTP {status_code}"
+
 
 class GraphAPIAdapter(InstagramAdapter):
     """
@@ -341,3 +440,333 @@ class GraphAPIAdapter(InstagramAdapter):
                 {"media_type": "STORIES", "image_url": image_url},
             )
             return self._publish_container(client, ig_user_id, str(container["id"]))
+
+    # ------------------------------------------------------------------
+    # Insights & analytics
+    # ------------------------------------------------------------------
+    def can_fetch_insights(self) -> bool:
+        return bool(self.access_token and (self.ig_user_id or self._is_instagram_login()))
+
+    def _ensure_insights_ready(self) -> None:
+        missing = []
+        if not self.access_token:
+            missing.append("access_token")
+        if not self.ig_user_id and not self._is_instagram_login():
+            missing.append("ig_user_id")
+        if missing:
+            raise RuntimeError(f"Graph API no configurado para insights. Faltan: {', '.join(missing)}")
+
+    def _get_graph(
+        self,
+        client: httpx.Client,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> tuple[int, dict[str, Any], str]:
+        req_params = {**(params or {}), "access_token": self.access_token}
+        resp = client.get(f"{self.base_url}/{path.lstrip('/')}", params=req_params)
+        try:
+            data = resp.json()
+        except Exception:
+            data = {}
+        return resp.status_code, data if isinstance(data, dict) else {}, resp.text
+
+    def fetch_account_insights(self, days: int = 7) -> dict[str, Any]:
+        """Fetch account profile counters, rolling totals, and daily reach/follower time series."""
+        self._ensure_insights_ready()
+        clamped_days = max(1, min(int(days), 30))
+        until_ts = int(time.time())
+        since_ts = until_ts - clamped_days * 86400
+
+        with httpx.Client(timeout=20.0) as client:
+            ig_user_id = self._resolve_user_id(client)
+            prof_status, prof_data, prof_raw = self._get_graph(
+                client,
+                ig_user_id,
+                {"fields": "id,username,name,followers_count,follows_count,media_count"},
+            )
+            if prof_status >= 400 or "error" in prof_data:
+                _, _, msg = _parse_graph_error(prof_status, prof_data, prof_raw)
+                raise RuntimeError(f"Error al consultar perfil de Instagram: {msg}")
+
+            totals: dict[str, int] = {}
+            daily_map: dict[str, dict[str, int]] = {}
+            error_messages: list[str] = []
+
+            # 1. Daily time series (reach, follower_count)
+            ts_status, ts_data, ts_raw = self._get_graph(
+                client,
+                f"{ig_user_id}/insights",
+                {
+                    "metric": ",".join(ACCOUNT_TIMESERIES_METRICS),
+                    "period": "day",
+                    "since": since_ts,
+                    "until": until_ts,
+                },
+            )
+            permission_missing = False
+            if ts_status < 400 and "error" not in ts_data:
+                for item in ts_data.get("data") or []:
+                    mname = item.get("name")
+                    for pt in item.get("values") or []:
+                        end_time = str(pt.get("end_time") or "")
+                        day_key = end_time[:10] if len(end_time) >= 10 else end_time
+                        if not day_key:
+                            continue
+                        bucket = daily_map.setdefault(day_key, {"reach": 0, "follower_count": 0})
+                        try:
+                            val = int(pt.get("value", 0))
+                        except (TypeError, ValueError):
+                            val = 0
+                        if mname in ("reach", "follower_count"):
+                            bucket[mname] = val
+            else:
+                code, _, msg = _parse_graph_error(ts_status, ts_data, ts_raw)
+                if code == 10:
+                    permission_missing = True
+                    error_messages.append(
+                        "Falta el permiso instagram_manage_insights (o instagram_business_manage_insights) en el token."
+                    )
+                else:
+                    error_messages.append(msg)
+
+            # 2. Rolling total_value metrics
+            if not permission_missing:
+                tv_status, tv_data, tv_raw = self._get_graph(
+                    client,
+                    f"{ig_user_id}/insights",
+                    {
+                        "metric": ",".join(ACCOUNT_TOTAL_METRICS),
+                        "period": "day",
+                        "metric_type": "total_value",
+                        "since": since_ts,
+                        "until": until_ts,
+                    },
+                )
+                if tv_status < 400 and "error" not in tv_data:
+                    for item in tv_data.get("data") or []:
+                        mname = item.get("name")
+                        val = _extract_metric_int(item)
+                        if mname and val is not None:
+                            totals[mname] = val
+                else:
+                    code, _, msg = _parse_graph_error(tv_status, tv_data, tv_raw)
+                    if code == 10:
+                        error_messages.append(
+                            "Falta el permiso instagram_manage_insights (o instagram_business_manage_insights) en el token."
+                        )
+                    else:
+                        # Fallback per-metric so unsupported single metrics don't drop everything
+                        for m in ACCOUNT_TOTAL_METRICS:
+                            m_st, m_data, _ = self._get_graph(
+                                client,
+                                f"{ig_user_id}/insights",
+                                {
+                                    "metric": m,
+                                    "period": "day",
+                                    "metric_type": "total_value",
+                                    "since": since_ts,
+                                    "until": until_ts,
+                                },
+                            )
+                            if m_st < 400 and "error" not in m_data:
+                                for item in m_data.get("data") or []:
+                                    val = _extract_metric_int(item)
+                                    if val is not None:
+                                        totals[m] = val
+
+            daily_series = [
+                {
+                    "date": day_key,
+                    "reach": daily_map[day_key]["reach"],
+                    "follower_count": daily_map[day_key]["follower_count"],
+                }
+                for day_key in sorted(daily_map.keys())
+            ]
+            if daily_series:
+                totals["reach"] = sum(pt["reach"] for pt in daily_series)
+                totals["follower_delta"] = sum(pt["follower_count"] for pt in daily_series)
+
+            return {
+                "period_days": clamped_days,
+                "ig_user_id": ig_user_id,
+                "username": str(prof_data.get("username") or ""),
+                "name": str(prof_data.get("name") or ""),
+                "followers_count": prof_data.get("followers_count"),
+                "follows_count": prof_data.get("follows_count"),
+                "media_count": prof_data.get("media_count"),
+                "totals": totals,
+                "daily_series": daily_series,
+                "error_message": "; ".join(dict.fromkeys(error_messages)) or None,
+            }
+
+    def fetch_account_media(self, limit: int = 50) -> list[dict[str, Any]]:
+        """List recent posts, carousels, and reels from the Instagram account."""
+        self._ensure_insights_ready()
+        with httpx.Client(timeout=20.0) as client:
+            ig_user_id = self._resolve_user_id(client)
+            status, data, raw = self._get_graph(
+                client,
+                f"{ig_user_id}/media",
+                {"fields": MEDIA_LIST_FIELDS, "limit": max(1, min(int(limit), 100))},
+            )
+            if status >= 400 or "error" in data:
+                _, _, msg = _parse_graph_error(status, data, raw)
+                raise RuntimeError(f"Error al listar publicaciones de Instagram: {msg}")
+            return list(data.get("data") or [])
+
+    def fetch_active_stories(self) -> list[dict[str, Any]]:
+        """List currently active (<24h) stories from the Instagram account."""
+        self._ensure_insights_ready()
+        with httpx.Client(timeout=20.0) as client:
+            ig_user_id = self._resolve_user_id(client)
+            status, data, raw = self._get_graph(
+                client,
+                f"{ig_user_id}/stories",
+                {"fields": STORY_LIST_FIELDS},
+            )
+            if status >= 400 or "error" in data:
+                _, _, msg = _parse_graph_error(status, data, raw)
+                raise RuntimeError(f"Error al listar historias activas de Instagram: {msg}")
+            return list(data.get("data") or [])
+
+    def fetch_media_insights(
+        self,
+        external_id: str,
+        *,
+        media_product_type: str = "FEED",
+        media_type: str = "IMAGE",
+        fallback_likes: int | None = None,
+        fallback_comments: int | None = None,
+        include_metadata: bool = False,
+    ) -> dict[str, Any]:
+        """Fetch lifetime insights (and story navigation breakdown) for a post, carousel, reel, or story."""
+        self._ensure_insights_ready()
+        product = (media_product_type or "FEED").upper()
+        if product == "STORY":
+            metric_list = STORY_INSIGHT_METRICS
+        elif product == "REELS":
+            metric_list = REELS_INSIGHT_METRICS
+        else:
+            metric_list = FEED_INSIGHT_METRICS
+
+        metrics: dict[str, int] = {}
+        extra_metrics: dict[str, Any] = {}
+        navigation_breakdown: dict[str, int] = {}
+        metadata: dict[str, Any] = {}
+        expired = False
+        error_message: str | None = None
+
+        with httpx.Client(timeout=20.0) as client:
+            if include_metadata:
+                meta_fields = STORY_LIST_FIELDS if product == "STORY" else MEDIA_LIST_FIELDS
+                m_st, m_data, m_raw = self._get_graph(client, external_id, {"fields": meta_fields})
+                if m_st < 400 and "error" not in m_data:
+                    metadata = m_data
+                    if m_data.get("media_product_type"):
+                        product = str(m_data["media_product_type"]).upper()
+                        if product == "STORY":
+                            metric_list = STORY_INSIGHT_METRICS
+                        elif product == "REELS":
+                            metric_list = REELS_INSIGHT_METRICS
+                        else:
+                            metric_list = FEED_INSIGHT_METRICS
+                    if fallback_likes is None and m_data.get("like_count") is not None:
+                        fallback_likes = int(m_data["like_count"])
+                    if fallback_comments is None and m_data.get("comments_count") is not None:
+                        fallback_comments = int(m_data["comments_count"])
+                else:
+                    code, subcode, msg = _parse_graph_error(m_st, m_data, m_raw)
+                    if code == 100 and subcode == 33:
+                        expired = True
+                        error_message = (
+                            "Historia expirada (>24h) o contenido eliminado en Instagram; se conservan los últimos datos."
+                        )
+                        return {
+                            "metrics": {},
+                            "extra_metrics": {},
+                            "navigation_breakdown": {},
+                            "metadata": {},
+                            "expired": True,
+                            "error_message": error_message,
+                        }
+
+            # Batch request for insights
+            ins_st, ins_data, ins_raw = self._get_graph(
+                client,
+                f"{external_id}/insights",
+                {"metric": ",".join(metric_list)},
+            )
+            if ins_st < 400 and "error" not in ins_data:
+                for item in ins_data.get("data") or []:
+                    mname = item.get("name")
+                    val = _extract_metric_int(item)
+                    if mname and val is not None:
+                        metrics[mname] = val
+            else:
+                code, subcode, msg = _parse_graph_error(ins_st, ins_data, ins_raw)
+                lower_msg = msg.lower()
+                if code == 100 and subcode == 33:
+                    expired = True
+                    error_message = (
+                        "Historia expirada (>24h) o contenido eliminado en Instagram; se conservan los últimos datos."
+                    )
+                elif code == 10 and "not enough viewers" in lower_msg:
+                    error_message = "Aún no hay suficientes espectadores (<5) para mostrar insights en Meta."
+                elif code == 10:
+                    error_message = (
+                        "Falta el permiso instagram_manage_insights (o instagram_business_manage_insights) en el token."
+                    )
+                else:
+                    # Try individual metrics in case one metric isn't supported for this media subtype
+                    for m in metric_list:
+                        s_st, s_data, _ = self._get_graph(client, f"{external_id}/insights", {"metric": m})
+                        if s_st < 400 and "error" not in s_data:
+                            for item in s_data.get("data") or []:
+                                val = _extract_metric_int(item)
+                                if val is not None:
+                                    metrics[m] = val
+                    if not metrics:
+                        error_message = msg
+
+            # Story navigation breakdown (tap_forward, tap_back, tap_exit, swipe_forward)
+            if product == "STORY" and not expired and "navigation" in metrics:
+                bd_st, bd_data, _ = self._get_graph(
+                    client,
+                    f"{external_id}/insights",
+                    {"metric": "navigation", "breakdown": "story_navigation_action_type"},
+                )
+                if bd_st < 400 and "error" not in bd_data:
+                    navigation_breakdown = _extract_navigation_breakdown(list(bd_data.get("data") or []))
+
+        # Keep extra Reels/non-standard metrics separately
+        known_cols = {
+            "views",
+            "reach",
+            "likes",
+            "comments",
+            "saved",
+            "shares",
+            "replies",
+            "total_interactions",
+            "follows",
+            "profile_visits",
+            "profile_activity",
+            "navigation",
+        }
+        for k, v in list(metrics.items()):
+            if k not in known_cols:
+                extra_metrics[k] = v
+
+        if "likes" not in metrics and fallback_likes is not None:
+            metrics["likes"] = fallback_likes
+        if "comments" not in metrics and fallback_comments is not None:
+            metrics["comments"] = fallback_comments
+
+        return {
+            "metrics": {k: v for k, v in metrics.items() if k in known_cols},
+            "extra_metrics": extra_metrics,
+            "navigation_breakdown": navigation_breakdown,
+            "metadata": metadata,
+            "expired": expired,
+            "error_message": error_message,
+        }

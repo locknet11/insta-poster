@@ -1,13 +1,28 @@
 import React from 'react';
-import { Images, CalendarClock, CheckCircle2, Smartphone, RefreshCw, Terminal, Plus } from 'lucide-react';
+import {
+  Images,
+  CalendarClock,
+  CheckCircle2,
+  Smartphone,
+  RefreshCw,
+  Terminal,
+  Plus,
+  BarChart3,
+  Users,
+  Eye,
+  Heart,
+  TrendingUp,
+} from 'lucide-react';
 import { useI18n } from '../i18n.jsx';
 import SchematicCard from './SchematicCard.jsx';
 
-export default function DashboardView({ stats, publications, activity, adapters, onNavigate, onRefresh }) {
+export default function DashboardView({ stats, insights, publications, activity, adapters, onNavigate, onRefresh }) {
   const { t, locale } = useI18n();
   const scheduled = publications.filter((p) => p.status === 'scheduled').slice(0, 5);
   const activeAdapter = adapters.find((a) => a.is_default);
   const isDry = activeAdapter?.name === 'dry_run';
+  const account = insights?.account;
+  const fmt = (v) => (v === null || v === undefined ? '—' : Number(v).toLocaleString());
 
   return (
     <div className="stack">
@@ -81,6 +96,74 @@ export default function DashboardView({ stats, publications, activity, adapters,
           </div>
         </div>
       </SchematicCard>
+
+      {account && (
+        <SchematicCard
+          label={t('dashboard.insightsLabel', {
+            username: account.username || account.ig_user_id,
+            days: account.period_days,
+          })}
+          right={
+            <button type="button" className="btn btn-sm" onClick={() => onNavigate('insights')}>
+              <BarChart3 size={12} strokeWidth={1.5} /> {t('dashboard.openInsights')}
+            </button>
+          }
+          noPadding
+        >
+          <div className="metrics-strip">
+            <div className="metric-cell">
+              <div className="metric-label">
+                <span>{t('insights.kpi.followers')}</span>
+                <Users size={14} strokeWidth={1.5} />
+              </div>
+              <div className="metric-value">{fmt(account.followers_count)}</div>
+              <div className="metric-sub">
+                {t('insights.accountFollowersSub', {
+                  following: fmt(account.follows_count),
+                  posts: fmt(account.media_count),
+                })}
+              </div>
+            </div>
+
+            <div className="metric-cell">
+              <div className="metric-label">
+                <span>{t('insights.kpi.viewsWindow', { days: account.period_days })}</span>
+                <Eye size={14} strokeWidth={1.5} />
+              </div>
+              <div className="metric-value">{fmt(account.totals?.views)}</div>
+              <div className="metric-sub">
+                {t('insights.accountReachSub', { reach: fmt(account.totals?.reach) })}
+              </div>
+            </div>
+
+            <div className="metric-cell">
+              <div className="metric-label">
+                <span>{t('insights.kpi.interactions')}</span>
+                <Heart size={14} strokeWidth={1.5} />
+              </div>
+              <div className="metric-value">{fmt(account.totals?.total_interactions)}</div>
+              <div className="metric-sub">
+                {t('insights.accountEngagedSub', {
+                  accounts: fmt(account.totals?.accounts_engaged),
+                })}
+              </div>
+            </div>
+
+            <div className="metric-cell">
+              <div className="metric-label">
+                <span>{t('insights.kpi.profileVisits')}</span>
+                <TrendingUp size={14} strokeWidth={1.5} />
+              </div>
+              <div className="metric-value">{fmt(account.totals?.profile_views)}</div>
+              <div className="metric-sub">
+                {t('insights.syncedBadge', {
+                  date: new Date(account.synced_at).toLocaleDateString(locale),
+                })}
+              </div>
+            </div>
+          </div>
+        </SchematicCard>
+      )}
 
       {activeAdapter && (
         <SchematicCard

@@ -25,6 +25,7 @@ post_app = typer.Typer(help="Crear y publicar posts o carruseles de feed.")
 story_app = typer.Typer(help="Crear y publicar historias (Stories 9:16).")
 queue_app = typer.Typer(help="Consultar, publicar o cancelar la cola e historial.")
 adapter_app = typer.Typer(help="Gestionar adaptadores de Instagram (dry_run, graph_api).")
+insights_app = typer.Typer(help="Sincronizar y consultar métricas (Insights) de cuenta, posts e historias.")
 user_app = typer.Typer(help="Gestionar usuarios de autenticación de la webapp y API.")
 apikey_app = typer.Typer(help="Gestionar API Keys para agentes y automatizaciones.")
 
@@ -33,6 +34,7 @@ app.add_typer(post_app, name="post")
 app.add_typer(story_app, name="story")
 app.add_typer(queue_app, name="queue")
 app.add_typer(adapter_app, name="adapter")
+app.add_typer(insights_app, name="insights")
 app.add_typer(user_app, name="user")
 app.add_typer(apikey_app, name="apikey")
 
@@ -683,6 +685,112 @@ def apikey_revoke(
         _emit({"deleted": True, "id": key_id}, True)
     else:
         console.print(f"[green]API Key revocada[/green]: {key_id}")
+
+
+# ----------------------------------------------------------------------
+# Insights commands
+# ----------------------------------------------------------------------
+@insights_app.command("sync")
+def insights_sync(
+    days: int = typer.Option(7, "--days", help="Ventana de días para métricas de cuenta (1-30)."),
+    stories_only: bool = typer.Option(False, "--stories-only", help="Sincronizar solo historias activas (<24h)."),
+    as_json: bool = typer.Option(False, "--json"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+) -> None:
+    """Sincroniza métricas de cuenta, posts/carruseles e historias activas desde Meta Graph API."""
+    svc = _get_service(data_dir)
+    try:
+        res = svc.sync_insights(days=days, stories_only=stories_only, actor="cli")
+    except Exception as exc:
+        typer.echo(json.dumps({"error": str(exc)}) if as_json else f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+    if as_json:
+        _emit(res.model_dump(), True)
+        return
+    console.print(
+        f"[green]Insights sincronizados[/green] ({res.synced_at}): "
+        f"{res.synced_media_count} posts/reels, {res.synced_stories_count} historias."
+    )
+    if res.account:
+        console.print(
+            f"Cuenta @{res.account.username}: {res.account.followers_count} seguidores · "
+            f"views({res.period_days}d)={res.account.totals.get('views', '-')} · "
+            f"reach({res.period_days}d)={res.account.totals.get('reach', '-')}"
+        )
+    for err in res.errors:
+        console.print(f"[yellow]Aviso:[/yellow] {err}")
+
+
+@insights_app.command("overview")
+def insights_overview(
+    days: int = typer.Option(7, "--days", help="Ventana de cuenta a consultar (1-30)."),
+    product_type: Optional[str] = typer.Option(None, "--type", help="FEED|STORY|REELS"),
+    sort_by: str = typer.Option("published_at", "--sort", help="published_at|views|reach|total_interactions|likes|saved|shares|profile_visits"),
+    limit: int = typer.Option(50, "--limit"),
+    as_json: bool = typer.Option(False, "--json"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+) -> None:
+    """Muestra el resumen de métricas almacenadas de cuenta, posts e historias."""
+    svc = _get_service(data_dir)
+    ov = svc.get_insights_overview(
+        days=days,
+        media_product_type=product_type,
+        sort_by=sort_by,
+        limit=limit,
+    )
+    if as_json:
+        _emit(ov.model_dump(), True)
+        return
+    if ov.account:
+        console.print(
+            f"[bold]@{ov.account.username}[/bold] · Seguidores: {ov.account.followers_count} · "
+            f"Vistas ({ov.account.period_days}d): {ov.account.totals.get('views', '-')} · "
+            f"Alcance: {ov.account.totals.get('reach', '-')}"
+        )
+    table = Table(title=f"Insights de Contenido ({len(ov.items)})")
+    table.add_column("ID", style="cyan")
+    table.add_column("Tipo")
+    table.add_column("Views", justify="right")
+    table.add_column("Reach", justify="right")
+    table.add_column("Likes/Repl", justify="right")
+    table.add_column("Saved", justify="right")
+    table.add_column("Shares", justify="right")
+    table.add_column("ER%", justify="right")
+    for item in ov.items:
+        lr = item.replies if item.media_product_type == "STORY" else item.likes
+        table.add_row(
+            item.publication_id or item.external_id[-8:],
+            f"{item.pub_type or item.media_product_type}{'*' if item.media_product_type == 'STORY' and item.is_active else ''}",
+            str(item.views if item.views is not None else "-"),
+            str(item.reach if item.reach is not None else "-"),
+            str(lr if lr is not None else "-"),
+            str(item.saved if item.saved is not None else "-"),
+            str(item.shares if item.shares is not None else "-"),
+            f"{item.engagement_rate}%" if item.engagement_rate is not None else "-",
+        )
+    console.print(table)
+
+
+@insights_app.command("show")
+def insights_show(
+    identifier: str = typer.Argument(..., help="ID local de publicación o Meta external_id."),
+    sync: bool = typer.Option(False, "--sync", help="Actualizar desde Meta antes de mostrar."),
+    history: bool = typer.Option(False, "--history", help="Incluir historial de snapshots."),
+    as_json: bool = typer.Option(False, "--json"),
+    data_dir: Optional[Path] = typer.Option(None, "--data-dir"),
+) -> None:
+    """Muestra las métricas detalladas (y snapshots opcionales) de un post o historia."""
+    svc = _get_service(data_dir)
+    try:
+        item = svc.sync_publication_insights(identifier, actor="cli") if sync else svc.get_media_insight(identifier)
+        snaps = svc.get_media_insight_history(identifier) if history else []
+    except Exception as exc:
+        typer.echo(json.dumps({"error": str(exc)}) if as_json else f"Error: {exc}", err=True)
+        raise typer.Exit(code=1)
+    payload = item.model_dump()
+    if history:
+        payload["history"] = [s.model_dump() for s in snaps]
+    _emit(payload, as_json)
 
 
 if __name__ == "__main__":

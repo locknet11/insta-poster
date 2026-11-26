@@ -7,6 +7,7 @@ import DashboardView from './components/DashboardView.jsx';
 import PoolView from './components/PoolView.jsx';
 import ComposerView from './components/ComposerView.jsx';
 import QueueView from './components/QueueView.jsx';
+import InsightsView from './components/InsightsView.jsx';
 import SettingsAgentView from './components/SettingsAgentView.jsx';
 import UsersView from './components/UsersView.jsx';
 
@@ -20,6 +21,7 @@ export default function App() {
   });
   const [tab, setTab] = useState('dashboard');
   const [stats, setStats] = useState(null);
+  const [insights, setInsights] = useState(null);
   const [pool, setPool] = useState([]);
   const [publications, setPublications] = useState([]);
   const [adapters, setAdapters] = useState([]);
@@ -67,18 +69,20 @@ export default function App() {
 
   const refreshAll = useCallback(async () => {
     try {
-      const [s, p, pubs, ad, act] = await Promise.all([
+      const [s, p, pubs, ad, act, ins] = await Promise.all([
         api.stats(),
         api.listPool({ limit: 400 }),
         api.listPublications({ limit: 200 }),
         api.listAdapters(false),
         api.activity(40),
+        api.getInsights({ days: 7, limit: 50 }).catch(() => null),
       ]);
       setStats(s);
       setPool(p);
       setPublications(pubs);
       setAdapters(ad);
       setActivity(act);
+      if (ins) setInsights(ins);
     } catch (err) {
       if (err.status === 401) return;
       notify(t('common.loadError', { error: err.message }), 'error');
@@ -99,6 +103,7 @@ export default function App() {
       // ignore
     }
     setStats(null);
+    setInsights(null);
     setPool([]);
     setPublications([]);
     setAdapters([]);
@@ -154,6 +159,7 @@ export default function App() {
           setTab(next);
         }}
         stats={stats}
+        insights={insights}
         currentUser={auth.user}
         onLogout={handleLogout}
       />
@@ -161,6 +167,7 @@ export default function App() {
         {tab === 'dashboard' && (
           <DashboardView
             stats={stats}
+            insights={insights}
             publications={publications}
             activity={activity}
             adapters={adapters}
@@ -205,6 +212,13 @@ export default function App() {
             publications={publications}
             pool={pool}
             onEdit={openEditorForPub}
+            onRefresh={refreshAll}
+            notify={notify}
+          />
+        )}
+        {tab === 'insights' && (
+          <InsightsView
+            onNavigate={setTab}
             onRefresh={refreshAll}
             notify={notify}
           />

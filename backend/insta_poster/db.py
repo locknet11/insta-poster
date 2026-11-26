@@ -113,6 +113,73 @@ CREATE TABLE IF NOT EXISTS api_keys (
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_keys_created ON api_keys(created_at DESC);
+
+CREATE TABLE IF NOT EXISTS media_insights (
+    external_id TEXT PRIMARY KEY,
+    publication_id TEXT,
+    media_type TEXT NOT NULL DEFAULT 'IMAGE',
+    media_product_type TEXT NOT NULL DEFAULT 'FEED',
+    caption TEXT NOT NULL DEFAULT '',
+    permalink TEXT,
+    thumbnail_url TEXT,
+    published_at TEXT,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    views INTEGER,
+    reach INTEGER,
+    likes INTEGER,
+    comments INTEGER,
+    saved INTEGER,
+    shares INTEGER,
+    replies INTEGER,
+    total_interactions INTEGER,
+    follows INTEGER,
+    profile_visits INTEGER,
+    profile_activity INTEGER,
+    navigation INTEGER,
+    navigation_breakdown TEXT NOT NULL DEFAULT '{}',
+    extra_metrics TEXT NOT NULL DEFAULT '{}',
+    error_message TEXT,
+    synced_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_insights_product ON media_insights(media_product_type, published_at DESC);
+CREATE INDEX IF NOT EXISTS idx_media_insights_pub ON media_insights(publication_id);
+
+CREATE TABLE IF NOT EXISTS media_insight_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    external_id TEXT NOT NULL,
+    views INTEGER,
+    reach INTEGER,
+    likes INTEGER,
+    comments INTEGER,
+    saved INTEGER,
+    shares INTEGER,
+    replies INTEGER,
+    total_interactions INTEGER,
+    follows INTEGER,
+    profile_visits INTEGER,
+    navigation INTEGER,
+    navigation_breakdown TEXT NOT NULL DEFAULT '{}',
+    captured_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_media_snapshots_ext ON media_insight_snapshots(external_id, captured_at DESC);
+
+CREATE TABLE IF NOT EXISTS account_insights (
+    period_days INTEGER PRIMARY KEY,
+    ig_user_id TEXT NOT NULL DEFAULT '',
+    username TEXT NOT NULL DEFAULT '',
+    name TEXT NOT NULL DEFAULT '',
+    followers_count INTEGER,
+    follows_count INTEGER,
+    media_count INTEGER,
+    totals TEXT NOT NULL DEFAULT '{}',
+    daily_series TEXT NOT NULL DEFAULT '[]',
+    error_message TEXT,
+    synced_at TEXT NOT NULL
+);
 """
 
 

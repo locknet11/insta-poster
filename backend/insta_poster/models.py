@@ -81,6 +81,26 @@ class PublicationUpdate(BaseModel):
     metadata: dict[str, Any] | None = None
 
 
+class MediaInsightSummary(BaseModel):
+    external_id: str
+    views: int | None = None
+    reach: int | None = None
+    likes: int | None = None
+    comments: int | None = None
+    saved: int | None = None
+    shares: int | None = None
+    replies: int | None = None
+    total_interactions: int | None = None
+    follows: int | None = None
+    profile_visits: int | None = None
+    navigation: int | None = None
+    navigation_breakdown: dict[str, int] = Field(default_factory=dict)
+    engagement_rate: float | None = None
+    is_active: bool = True
+    error_message: str | None = None
+    synced_at: str
+
+
 class Publication(BaseModel):
     id: str
     pub_type: PubType
@@ -102,6 +122,113 @@ class Publication(BaseModel):
     created_by: str = "user"
     created_at: str
     updated_at: str
+    insights: MediaInsightSummary | None = None
+
+
+class MediaInsight(BaseModel):
+    external_id: str
+    publication_id: str | None = None
+    pub_type: str | None = None
+    media_type: str = "IMAGE"
+    media_product_type: str = "FEED"
+    caption: str = ""
+    permalink: str | None = None
+    thumbnail_url: str | None = None
+    published_at: str | None = None
+    is_active: bool = True
+    views: int | None = None
+    reach: int | None = None
+    likes: int | None = None
+    comments: int | None = None
+    saved: int | None = None
+    shares: int | None = None
+    replies: int | None = None
+    total_interactions: int | None = None
+    follows: int | None = None
+    profile_visits: int | None = None
+    profile_activity: int | None = None
+    navigation: int | None = None
+    navigation_breakdown: dict[str, int] = Field(default_factory=dict)
+    engagement_rate: float | None = None
+    extra_metrics: dict[str, Any] = Field(default_factory=dict)
+    error_message: str | None = None
+    synced_at: str
+    snapshots_count: int = 0
+
+
+class MediaInsightSnapshot(BaseModel):
+    id: int
+    external_id: str
+    views: int | None = None
+    reach: int | None = None
+    likes: int | None = None
+    comments: int | None = None
+    saved: int | None = None
+    shares: int | None = None
+    replies: int | None = None
+    total_interactions: int | None = None
+    follows: int | None = None
+    profile_visits: int | None = None
+    navigation: int | None = None
+    navigation_breakdown: dict[str, int] = Field(default_factory=dict)
+    captured_at: str
+
+
+class AccountDailyPoint(BaseModel):
+    date: str
+    reach: int = 0
+    follower_count: int = 0
+
+
+class AccountInsights(BaseModel):
+    period_days: int = 7
+    ig_user_id: str = ""
+    username: str = ""
+    name: str = ""
+    followers_count: int | None = None
+    follows_count: int | None = None
+    media_count: int | None = None
+    totals: dict[str, int] = Field(default_factory=dict)
+    daily_series: list[AccountDailyPoint] = Field(default_factory=list)
+    error_message: str | None = None
+    synced_at: str
+
+
+class InsightsSummary(BaseModel):
+    total_items: int = 0
+    feed_count: int = 0
+    story_count: int = 0
+    active_stories_count: int = 0
+    reels_count: int = 0
+    total_views: int = 0
+    total_reach: int = 0
+    total_likes: int = 0
+    total_comments: int = 0
+    total_saved: int = 0
+    total_shares: int = 0
+    total_replies: int = 0
+    total_interactions: int = 0
+    total_profile_visits: int = 0
+    total_follows: int = 0
+    avg_engagement_rate: float | None = None
+
+
+class InsightsOverview(BaseModel):
+    account: AccountInsights | None = None
+    summary: InsightsSummary = Field(default_factory=InsightsSummary)
+    items: list[MediaInsight] = Field(default_factory=list)
+    last_synced_at: str | None = None
+    adapter_configured: bool = False
+    auto_sync_interval_minutes: int = 30
+
+
+class InsightsSyncResponse(BaseModel):
+    synced_at: str
+    period_days: int = 7
+    account: AccountInsights | None = None
+    synced_media_count: int = 0
+    synced_stories_count: int = 0
+    errors: list[str] = Field(default_factory=list)
 
 
 class AdapterStatus(BaseModel):
